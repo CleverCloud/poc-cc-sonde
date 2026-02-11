@@ -11,6 +11,9 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1.11"
+clap = { version = "4.5", features = ["derive"] }
+hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [dev-dependencies]
 mockito = "1.6"

@@ -1,11 +1,28 @@
 mod config;
 mod executor;
+mod healthcheck;
 mod probe;
 mod scheduler;
 
-use std::env;
+use clap::Parser;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Configuration file path
+    #[arg(default_value = "config.toml")]
+    config: String,
+
+    /// Enable health check HTTP server
+    #[arg(long, default_value_t = false)]
+    healthcheck: bool,
+
+    /// Port for health check server (requires --healthcheck)
+    #[arg(long, default_value_t = 8080)]
+    healthcheck_port: u16,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -18,21 +35,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // Parse command line arguments
+    let args = Args::parse();
+
     info!("Starting HTTP monitoring application");
 
-    // Get config file path from command line args or use default
-    let args: Vec<String> = env::args().collect();
-    let config_path = args.get(1).map(|s| s.as_str()).unwrap_or("config.toml");
-
-    info!(config_path = %config_path, "Loading configuration");
-
     // Load and validate configuration
-    let config = config::Config::from_file(config_path)?;
+    info!(config_path = %args.config, "Loading configuration");
+    let config = config::Config::from_file(&args.config)?;
 
     info!(
         probe_count = config.probes.len(),
         "Configuration loaded successfully"
     );
+
+    // Spawn health check server if enabled
+    if args.healthcheck {
+        info!(
+            port = args.healthcheck_port,
+            "Starting health check server"
+        );
+        tokio::spawn(async move {
+            if let Err(e) = healthcheck::start_healthcheck_server(args.healthcheck_port).await {
+                tracing::error!(error = %e, "Health check server failed");
+            }
+        });
+    }
 
     // Spawn a task for each probe
     let mut handles = vec![];

@@ -12,6 +12,7 @@ A Rust-based HTTP monitoring application that periodically checks HTTP endpoints
   - HTTP header validation
 - **Failure Actions**: Execute shell commands when checks fail
 - **Concurrent Execution**: Run multiple probes simultaneously
+- **Health Check Endpoint**: Optional HTTP server for monitoring the application itself
 - **Structured Logging**: Detailed logging with configurable levels
 - **TOML Configuration**: Simple, human-readable configuration format
 
@@ -106,6 +107,52 @@ cargo run --release -- /path/to/config.toml
 
 # Or run the compiled binary directly
 ./target/release/poc-sonde config.toml
+
+# Enable health check endpoint on default port 8080
+./target/release/poc-sonde --healthcheck
+
+# Enable health check endpoint on custom port
+./target/release/poc-sonde --healthcheck --healthcheck-port 9090
+
+# Combine with custom config
+./target/release/poc-sonde myconfig.toml --healthcheck --healthcheck-port 3000
+```
+
+### Command Line Options
+
+```
+Usage: poc-sonde [OPTIONS] [CONFIG]
+
+Arguments:
+  [CONFIG]  Configuration file path [default: config.toml]
+
+Options:
+      --healthcheck
+          Enable health check HTTP server
+      --healthcheck-port <HEALTHCHECK_PORT>
+          Port for health check server (requires --healthcheck) [default: 8080]
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
+
+### Health Check Endpoint
+
+When enabled with `--healthcheck`, the application starts an HTTP server that responds to all requests with:
+- **Status**: 200 OK
+- **Body**: "Probe is running"
+- **Port**: Configurable via `--healthcheck-port` (default: 8080)
+
+This endpoint can be used to monitor the health of the monitoring application itself (meta-monitoring).
+
+```bash
+# Start with health check on port 8080
+./target/release/poc-sonde --healthcheck
+
+# Test the health check endpoint
+curl http://localhost:8080
+# Output: Probe is running
 ```
 
 ### Configuring Log Levels
