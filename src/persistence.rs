@@ -14,6 +14,8 @@ pub struct ProbeState {
     pub last_check_timestamp: u64,
     pub last_check_success: bool,
     pub next_check_timestamp: u64,
+    #[serde(default)]
+    pub consecutive_failures: u32,
 }
 
 #[async_trait::async_trait]

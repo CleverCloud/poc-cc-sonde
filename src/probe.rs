@@ -263,6 +263,7 @@ mod tests {
             command_timeout_seconds: 30,
             delay_after_success_seconds: None,
             delay_after_failure_seconds: None,
+            failure_retries_before_command: None,
         };
 
         let result = execute_probe(&probe).await;

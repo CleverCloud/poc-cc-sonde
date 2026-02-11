@@ -91,6 +91,7 @@ expected_body_regex = "\"version\":\\s*\"\\d+\\.\\d+\\.\\d+\""
 - `command_timeout_seconds` (optional): Timeout for command execution (default: 30)
 - `delay_after_success_seconds` (optional): Delay before next execution after successful check (defaults to `interval_seconds`)
 - `delay_after_failure_seconds` (optional): Delay before next execution after failed check (defaults to `interval_seconds`)
+- `failure_retries_before_command` (optional): Number of consecutive failures before executing the failure command (default: 0 = execute immediately)
 
 #### Check Types
 
@@ -185,6 +186,40 @@ expected_status = 200
 - **Fast failure detection**: Set short `delay_after_failure_seconds` to quickly detect recovery
 - **Reduced load when healthy**: Set longer `delay_after_success_seconds` to reduce monitoring overhead
 - **Exponential backoff**: Increase `delay_after_failure_seconds` to avoid overwhelming failing services
+
+### Failure Retry Threshold
+
+Avoid false alerts by requiring multiple consecutive failures before executing the failure command:
+
+```toml
+[[probes]]
+name = "API with Transient Issues"
+url = "https://api.example.com/health"
+interval_seconds = 60
+delay_after_failure_seconds = 10            # Retry every 10 seconds on failure
+failure_retries_before_command = 3          # Only execute command after 3 consecutive failures
+on_failure_command = "alert-admin.sh"
+
+[probes.checks]
+expected_status = 200
+```
+
+**How it works:**
+- The probe retries failed checks according to `delay_after_failure_seconds`
+- Consecutive failures are counted and persisted
+- The failure command is executed only when `consecutive_failures > failure_retries_before_command`
+- Counter resets to 0 on first successful check
+
+**Configuration examples:**
+- `failure_retries_before_command = 0` (default): Execute command immediately on first failure
+- `failure_retries_before_command = 3`: Wait for 3 failures before alerting (good for services with occasional hiccups)
+- `failure_retries_before_command = 10`: High tolerance (good for non-critical or flaky services)
+
+**Benefits:**
+- Reduces false alerts from transient network issues
+- Gives services time to self-recover before intervention
+- Prevents command/alert spam during outages
+- Different tolerance levels per probe
 
 ### Redis Persistence (Optional)
 

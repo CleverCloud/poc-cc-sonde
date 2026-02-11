@@ -17,8 +17,10 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) 
     );
 
     // Load previous state if exists
-    let mut next_delay = match backend.load_state(&probe.name).await {
-        Ok(Some(state)) => {
+    let previous_state = backend.load_state(&probe.name).await.ok().flatten();
+
+    let mut next_delay = match &previous_state {
+        Some(state) => {
             let now = persistence::current_timestamp();
             if state.next_check_timestamp > now {
                 let remaining = state.next_check_timestamp - now;
@@ -26,33 +28,32 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) 
                     probe_name = %probe.name,
                     remaining_seconds = remaining,
                     last_success = state.last_check_success,
+                    consecutive_failures = state.consecutive_failures,
                     "Resuming from saved state"
                 );
                 remaining
             } else {
                 info!(
                     probe_name = %probe.name,
+                    consecutive_failures = state.consecutive_failures,
                     "Saved state expired, starting immediately"
                 );
                 0
             }
         }
-        Ok(None) => {
+        None => {
             info!(
                 probe_name = %probe.name,
                 "No previous state found, starting immediately"
             );
             0
         }
-        Err(e) => {
-            error!(
-                probe_name = %probe.name,
-                error = %e,
-                "Failed to load state, starting immediately"
-            );
-            0
-        }
     };
+
+    let mut consecutive_failures = previous_state
+        .as_ref()
+        .map(|s| s.consecutive_failures)
+        .unwrap_or(0);
 
     loop {
         // Wait for the calculated delay
@@ -77,45 +78,65 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) 
                     probe_name = %probe.name,
                     "Probe succeeded"
                 );
+                // Reset consecutive failures on success
+                consecutive_failures = 0;
                 true
             }
             Err(failure) => {
+                // Increment consecutive failures
+                consecutive_failures += 1;
+
                 error!(
                     probe_name = %probe.name,
                     failure = %failure,
+                    consecutive_failures = consecutive_failures,
                     "Probe failed"
                 );
 
-                // Execute failure command if configured
+                // Execute failure command if configured and threshold reached
                 if let Some(ref command) = probe.on_failure_command {
-                    info!(
-                        probe_name = %probe.name,
-                        command = %command,
-                        "Executing failure command"
-                    );
+                    let retry_threshold = probe.get_failure_retries_before_command();
 
-                    match executor::execute_command(command, probe.command_timeout_seconds).await {
-                        Ok(output) => {
-                            if output.status.success() {
-                                info!(
-                                    probe_name = %probe.name,
-                                    "Failure command completed successfully"
-                                );
-                            } else {
+                    if consecutive_failures > retry_threshold {
+                        info!(
+                            probe_name = %probe.name,
+                            command = %command,
+                            consecutive_failures = consecutive_failures,
+                            threshold = retry_threshold,
+                            "Failure threshold reached, executing command"
+                        );
+
+                        match executor::execute_command(command, probe.command_timeout_seconds).await {
+                            Ok(output) => {
+                                if output.status.success() {
+                                    info!(
+                                        probe_name = %probe.name,
+                                        "Failure command completed successfully"
+                                    );
+                                } else {
+                                    error!(
+                                        probe_name = %probe.name,
+                                        exit_code = output.status.code().unwrap_or(-1),
+                                        "Failure command completed with errors"
+                                    );
+                                }
+                            }
+                            Err(e) => {
                                 error!(
                                     probe_name = %probe.name,
-                                    exit_code = output.status.code().unwrap_or(-1),
-                                    "Failure command completed with errors"
+                                    error = %e,
+                                    "Failed to execute failure command"
                                 );
                             }
                         }
-                        Err(e) => {
-                            error!(
-                                probe_name = %probe.name,
-                                error = %e,
-                                "Failed to execute failure command"
-                            );
-                        }
+                    } else {
+                        info!(
+                            probe_name = %probe.name,
+                            consecutive_failures = consecutive_failures,
+                            threshold = retry_threshold,
+                            remaining_retries = retry_threshold.saturating_sub(consecutive_failures),
+                            "Failure threshold not reached, retrying without command"
+                        );
                     }
                 }
                 false
@@ -135,6 +156,7 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) 
             last_check_timestamp: check_timestamp,
             last_check_success: success,
             next_check_timestamp: check_timestamp + next_delay,
+            consecutive_failures,
         };
 
         if let Err(e) = backend.save_state(&state).await {

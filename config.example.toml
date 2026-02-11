@@ -14,6 +14,8 @@ command_timeout_seconds = 30
 delay_after_success_seconds = 120
 # Optional: delay after failed check for faster retry (defaults to interval_seconds)
 delay_after_failure_seconds = 10
+# Optional: number of consecutive failures before executing command (default: 0 = immediate)
+failure_retries_before_command = 3
 
 [probes.checks]
 # Check that the response status is 200
