@@ -1,0 +1,270 @@
+use crate::config::Probe;
+use regex::Regex;
+use reqwest::Client;
+use std::time::Instant;
+use tracing::{error, info, warn};
+
+#[derive(Debug)]
+pub enum CheckFailure {
+    Status { expected: u16, actual: u16 },
+    BodyContains { expected: String, body: String },
+    BodyRegex { pattern: String, body: String },
+    Header { key: String, expected: String, actual: Option<String> },
+    RequestError { error: String },
+}
+
+impl std::fmt::Display for CheckFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckFailure::Status { expected, actual } => {
+                write!(f, "Status check failed: expected {}, got {}", expected, actual)
+            }
+            CheckFailure::BodyContains { expected, body } => {
+                write!(
+                    f,
+                    "Body contains check failed: expected '{}' in body (length: {})",
+                    expected,
+                    body.len()
+                )
+            }
+            CheckFailure::BodyRegex { pattern, body } => {
+                write!(
+                    f,
+                    "Body regex check failed: pattern '{}' not found in body (length: {})",
+                    pattern,
+                    body.len()
+                )
+            }
+            CheckFailure::Header { key, expected, actual } => {
+                write!(
+                    f,
+                    "Header check failed: expected '{}' = '{}', got {:?}",
+                    key, expected, actual
+                )
+            }
+            CheckFailure::RequestError { error } => {
+                write!(f, "Request error: {}", error)
+            }
+        }
+    }
+}
+
+pub async fn execute_probe(probe: &Probe) -> Result<bool, CheckFailure> {
+    let start = Instant::now();
+    info!(
+        probe_name = %probe.name,
+        url = %probe.url,
+        "Starting HTTP probe"
+    );
+
+    // Create HTTP client
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| CheckFailure::RequestError {
+            error: e.to_string(),
+        })?;
+
+    // Execute HTTP request
+    let response = match client.get(&probe.url).send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!(
+                probe_name = %probe.name,
+                url = %probe.url,
+                error = %e,
+                "HTTP request failed"
+            );
+            return Err(CheckFailure::RequestError {
+                error: e.to_string(),
+            });
+        }
+    };
+
+    let duration = start.elapsed();
+    let status = response.status().as_u16();
+
+    info!(
+        probe_name = %probe.name,
+        url = %probe.url,
+        status = status,
+        duration_ms = duration.as_millis(),
+        "Received HTTP response"
+    );
+
+    // Check status code
+    if let Some(expected_status) = probe.checks.expected_status {
+        if status != expected_status {
+            warn!(
+                probe_name = %probe.name,
+                expected = expected_status,
+                actual = status,
+                "Status code check failed"
+            );
+            return Err(CheckFailure::Status {
+                expected: expected_status,
+                actual: status,
+            });
+        }
+        info!(
+            probe_name = %probe.name,
+            status = status,
+            "Status code check passed"
+        );
+    }
+
+    // Get response body for body checks
+    let body = if probe.checks.expected_body_contains.is_some()
+        || probe.checks.expected_body_regex.is_some()
+    {
+        match response.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                error!(
+                    probe_name = %probe.name,
+                    error = %e,
+                    "Failed to read response body"
+                );
+                return Err(CheckFailure::RequestError {
+                    error: format!("Failed to read body: {}", e),
+                });
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    // Check body contains
+    if let Some(ref expected_contains) = probe.checks.expected_body_contains {
+        if !body.contains(expected_contains) {
+            warn!(
+                probe_name = %probe.name,
+                expected = %expected_contains,
+                body_preview = %&body[..body.len().min(100)],
+                "Body contains check failed"
+            );
+            return Err(CheckFailure::BodyContains {
+                expected: expected_contains.clone(),
+                body: body.clone(),
+            });
+        }
+        info!(
+            probe_name = %probe.name,
+            "Body contains check passed"
+        );
+    }
+
+    // Check body regex
+    if let Some(ref pattern) = probe.checks.expected_body_regex {
+        let re = Regex::new(pattern).map_err(|e| CheckFailure::RequestError {
+            error: format!("Invalid regex: {}", e),
+        })?;
+
+        if !re.is_match(&body) {
+            warn!(
+                probe_name = %probe.name,
+                pattern = %pattern,
+                body_preview = %&body[..body.len().min(100)],
+                "Body regex check failed"
+            );
+            return Err(CheckFailure::BodyRegex {
+                pattern: pattern.clone(),
+                body: body.clone(),
+            });
+        }
+        info!(
+            probe_name = %probe.name,
+            pattern = %pattern,
+            "Body regex check passed"
+        );
+    }
+
+    // Check headers (need to re-fetch if we consumed body)
+    if let Some(ref expected_headers) = probe.checks.expected_header {
+        // Re-fetch to get headers (since we consumed the response for body checks)
+        let response = match client.get(&probe.url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                return Err(CheckFailure::RequestError {
+                    error: e.to_string(),
+                });
+            }
+        };
+
+        for (key, expected_value) in expected_headers {
+            let actual_value = response
+                .headers()
+                .get(key)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            match actual_value {
+                Some(ref actual) if actual == expected_value => {
+                    info!(
+                        probe_name = %probe.name,
+                        header = %key,
+                        value = %expected_value,
+                        "Header check passed"
+                    );
+                }
+                actual => {
+                    warn!(
+                        probe_name = %probe.name,
+                        header = %key,
+                        expected = %expected_value,
+                        actual = ?actual,
+                        "Header check failed"
+                    );
+                    return Err(CheckFailure::Header {
+                        key: key.clone(),
+                        expected: expected_value.clone(),
+                        actual,
+                    });
+                }
+            }
+        }
+    }
+
+    info!(
+        probe_name = %probe.name,
+        duration_ms = duration.as_millis(),
+        "All checks passed"
+    );
+
+    Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Checks, Probe};
+
+    #[tokio::test]
+    async fn test_successful_probe() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_body(r#"{"status":"ok"}"#)
+            .create_async()
+            .await;
+
+        let probe = Probe {
+            name: "Test".to_string(),
+            url: server.url(),
+            interval_seconds: 1,
+            checks: Checks {
+                expected_status: Some(200),
+                expected_body_contains: Some("ok".to_string()),
+                expected_body_regex: None,
+                expected_header: None,
+            },
+            on_failure_command: None,
+            command_timeout_seconds: 30,
+        };
+
+        let result = execute_probe(&probe).await;
+        assert!(result.is_ok());
+        mock.assert_async().await;
+    }
+}
