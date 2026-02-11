@@ -27,3 +27,6 @@ Thumbs.db
 # Test outputs
 /tmp/
 test-failure.toml
+
+# Local configuration (use config.example.toml as template)
+config.toml
