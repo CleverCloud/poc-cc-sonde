@@ -18,21 +18,35 @@ pub struct ProbeState {
     pub consecutive_failures: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarpScriptProbeState {
+    pub probe_name: String,
+    pub last_check_timestamp: u64,
+    pub current_level: u32,
+    pub last_value: f64,
+    pub next_check_timestamp: u64,
+}
+
 #[async_trait::async_trait]
 pub trait PersistenceBackend: Send + Sync {
     async fn save_state(&self, state: &ProbeState) -> Result<(), Box<dyn std::error::Error>>;
     async fn load_state(&self, probe_name: &str) -> Result<Option<ProbeState>, Box<dyn std::error::Error>>;
+
+    async fn save_warpscript_state(&self, state: &WarpScriptProbeState) -> Result<(), Box<dyn std::error::Error>>;
+    async fn load_warpscript_state(&self, probe_name: &str) -> Result<Option<WarpScriptProbeState>, Box<dyn std::error::Error>>;
 }
 
 // In-memory implementation (default)
 pub struct InMemoryBackend {
     states: Arc<Mutex<HashMap<String, ProbeState>>>,
+    warpscript_states: Arc<Mutex<HashMap<String, WarpScriptProbeState>>>,
 }
 
 impl InMemoryBackend {
     pub fn new() -> Self {
         Self {
             states: Arc::new(Mutex::new(HashMap::new())),
+            warpscript_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -53,6 +67,23 @@ impl PersistenceBackend for InMemoryBackend {
 
     async fn load_state(&self, probe_name: &str) -> Result<Option<ProbeState>, Box<dyn std::error::Error>> {
         let states = self.states.lock().await;
+        Ok(states.get(probe_name).cloned())
+    }
+
+    async fn save_warpscript_state(&self, state: &WarpScriptProbeState) -> Result<(), Box<dyn std::error::Error>> {
+        let mut states = self.warpscript_states.lock().await;
+        states.insert(state.probe_name.clone(), state.clone());
+        debug!(
+            probe_name = %state.probe_name,
+            current_level = %state.current_level,
+            last_value = state.last_value,
+            "WarpScript state saved to memory"
+        );
+        Ok(())
+    }
+
+    async fn load_warpscript_state(&self, probe_name: &str) -> Result<Option<WarpScriptProbeState>, Box<dyn std::error::Error>> {
+        let states = self.warpscript_states.lock().await;
         Ok(states.get(probe_name).cloned())
     }
 }
@@ -126,6 +157,52 @@ impl PersistenceBackend for RedisBackend {
             }
             None => {
                 debug!(probe_name = %probe_name, "No state found in Redis");
+                Ok(None)
+            }
+        }
+    }
+
+    async fn save_warpscript_state(&self, state: &WarpScriptProbeState) -> Result<(), Box<dyn std::error::Error>> {
+        let mut con = self.client.get_multiplexed_async_connection().await?;
+        let key = format!("poc-sonde:warpscript:{}", state.probe_name);
+        let value = serde_json::to_string(state)?;
+
+        redis::cmd("SET")
+            .arg(&key)
+            .arg(&value)
+            .query_async::<()>(&mut con)
+            .await?;
+
+        debug!(
+            probe_name = %state.probe_name,
+            current_level = %state.current_level,
+            last_value = state.last_value,
+            "WarpScript state saved to Redis"
+        );
+        Ok(())
+    }
+
+    async fn load_warpscript_state(&self, probe_name: &str) -> Result<Option<WarpScriptProbeState>, Box<dyn std::error::Error>> {
+        let mut con = self.client.get_multiplexed_async_connection().await?;
+        let key = format!("poc-sonde:warpscript:{}", probe_name);
+
+        let value: Option<String> = redis::cmd("GET")
+            .arg(&key)
+            .query_async(&mut con)
+            .await?;
+
+        match value {
+            Some(json) => {
+                let state: WarpScriptProbeState = serde_json::from_str(&json)?;
+                debug!(
+                    probe_name = %probe_name,
+                    current_level = %state.current_level,
+                    "WarpScript state loaded from Redis"
+                );
+                Ok(Some(state))
+            }
+            None => {
+                debug!(probe_name = %probe_name, "No WarpScript state found in Redis");
                 Ok(None)
             }
         }

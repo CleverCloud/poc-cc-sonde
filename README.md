@@ -10,6 +10,14 @@ A Rust-based HTTP monitoring application that periodically checks HTTP endpoints
   - Response body content matching (substring)
   - Response body regex pattern matching
   - HTTP header validation
+- **WarpScript Probes**: Execute WarpScript queries and monitor scalar values with level-based auto-scaling
+  - Multi-level scaling (1, 2, 3, ...N levels)
+  - Automatic level transitions based on metric thresholds
+  - Execute scale up/down commands per level
+  - Manage multiple applications with a single configuration (apps)
+  - Custom Warp token per application
+  - Token and app ID substitution in WarpScript and commands
+  - Each app instance maintains independent state
 - **Failure Actions**: Execute shell commands when checks fail
 - **Concurrent Execution**: Run multiple probes simultaneously
 - **Health Check Endpoint**: Optional HTTP server for monitoring the application itself
@@ -220,6 +228,203 @@ expected_status = 200
 - Gives services time to self-recover before intervention
 - Prevents command/alert spam during outages
 - Different tolerance levels per probe
+
+### WarpScript Probes - Auto-Scaling
+
+Monitor metrics from Warp 10 and automatically scale your applications based on numeric thresholds.
+
+#### Prerequisites
+
+Set the following environment variables:
+```bash
+export WARP_ENDPOINT="https://warp.example.com/api/v0/exec"
+export WARP_TOKEN="YOUR_READ_TOKEN"
+```
+
+#### Configuration Example
+
+```toml
+[[warpscript_probes]]
+name = "CPU Auto-Scaler"
+warpscript_file = "warpscript/cpu_usage.mc2"
+interval_seconds = 60
+delay_after_scale_seconds = 120  # Wait 2min after scaling
+
+# Define apps with optional custom tokens
+[[warpscript_probes.apps]]
+id = "app_frontend"
+warp_token = "READ_TOKEN_FRONTEND"  # Optional: custom token
+
+[[warpscript_probes.apps]]
+id = "app_backend"
+# warp_token not specified: uses WARP_TOKEN env var
+
+# Level 1: Minimum scale (1 replica)
+[[warpscript_probes.levels]]
+level = 1
+scale_up_threshold = 70.0          # If CPU > 70%, scale up
+upscale_command = "clever scale --app ${APP_ID} --min-instances 2"
+
+# Level 2: Medium scale (2 replicas)
+[[warpscript_probes.levels]]
+level = 2
+scale_up_threshold = 85.0          # If CPU > 85%, scale up
+scale_down_threshold = 50.0        # If CPU < 50%, scale down
+upscale_command = "clever scale --app ${APP_ID} --min-instances 3"
+downscale_command = "clever scale --app ${APP_ID} --min-instances 1"
+
+# Level 3: Maximum scale (3 replicas)
+[[warpscript_probes.levels]]
+level = 3
+scale_down_threshold = 60.0        # If CPU < 60%, scale down
+downscale_command = "clever scale --app ${APP_ID} --min-instances 2"
+```
+
+#### Configuration Parameters
+
+**WarpScript Probe Configuration:**
+- `name` (required): A descriptive name for the probe
+- `warpscript_file` (required): Path to the WarpScript file to execute
+- `interval_seconds` (required): Interval between executions (in seconds)
+- `command_timeout_seconds` (optional): Timeout for command execution (default: 30)
+- `delay_after_scale_seconds` (optional): Delay after scaling up or down (defaults to `interval_seconds`)
+- `apps` (optional): List of applications to manage (default: empty list)
+
+**App Configuration:**
+- `id` (required): Application identifier
+- `warp_token` (optional): Custom Warp token for this app (overrides WARP_TOKEN env var)
+
+**Level Configuration:**
+- `level` (required): Level number (1, 2, 3, etc.) - must be unique and ordered
+- `scale_up_threshold` (optional): Value threshold to trigger upscale (move to level+1)
+- `scale_down_threshold` (optional): Value threshold to trigger downscale (move to level-1)
+- `upscale_command` (optional): Shell command to execute when scaling up from this level
+- `downscale_command` (optional): Shell command to execute when scaling down from this level
+
+**Notes:**
+- At least one level must be defined
+- Level 1 is considered the minimum level (downscale ignored)
+- Highest level number is considered the maximum level (upscale ignored)
+- At least one threshold per level should be defined (except at boundaries)
+- Commands support `${APP_ID}` placeholder for per-app execution
+
+#### WarpScript File Example
+
+```warpscript
+// warpscript/cpu_usage.mc2
+// ${WARP_TOKEN} is automatically replaced with the env var value
+// ${APP_ID} is replaced with the specific app_id for this probe instance
+
+'${WARP_TOKEN}' 'token' STORE
+'${APP_ID}' 'app' STORE
+
+// Fetch CPU metric for this specific app (last 5 minutes)
+[
+  $token
+  'os.cpu'
+  { 'app_id' $app }  // Filter by this specific app_id
+  NOW 5 m -
+  NOW
+]
+FETCH
+
+// Calculate average
+[ SWAP bucketizer.mean 0 1 0 ] BUCKETIZE
+
+// Return single value
+0 GET VALUES 0 GET 0 GET
+
+// Top of stack must be a number (e.g., 75.5)
+```
+
+#### How It Works
+
+1. **Probe Expansion**: If `apps` is specified, each app creates an independent probe instance
+   - Example: 3 apps = 3 separate probes with independent states
+2. **Execution**: WarpScript file is executed via HTTP POST to `WARP_ENDPOINT`
+3. **Token Substitution**: `${WARP_TOKEN}` in the file is replaced with:
+   - App's custom `warp_token` if specified
+   - Otherwise, `WARP_TOKEN` environment variable
+4. **App ID Substitution**: `${APP_ID}` is replaced with the specific app id for this probe instance
+   - In WarpScript files
+   - In scaling commands
+5. **Value Extraction**: Last element from JSON response array is used as the metric value
+6. **Scaling Logic**: Based on **current level** and value:
+   - If `value > scale_up_threshold` → **UPSCALE** (level + 1)
+     - Execute `upscale_command` of current level
+     - Increment level (unless already at max)
+   - If `value < scale_down_threshold` → **DOWNSCALE** (level - 1)
+     - Execute `downscale_command` of current level
+     - Decrement level (unless already at min)
+7. **Boundary Protection**:
+   - At **minimum level**: downscale is ignored
+   - At **maximum level**: upscale is ignored
+8. **State Persistence**: Current level and last value are persisted per probe instance (Redis or memory)
+
+#### Scaling Strategy Tips
+
+- **Hysteresis**: Set `scale_down_threshold` lower than `scale_up_threshold` to avoid flapping
+  - Example: Up at 70%, Down at 50% (20% hysteresis)
+- **Cooldown**: Use `delay_after_scale_seconds` to stabilize after scaling actions
+- **Gradual**: Define progressive thresholds (level 1→2 at 70%, level 2→3 at 85%)
+
+#### Managing Multiple Applications
+
+You can manage multiple applications with a single configuration using the `apps` array to avoid duplication:
+
+**In configuration:**
+```toml
+[[warpscript_probes]]
+name = "Multi-App Scaler"
+warpscript_file = "warpscript/metrics.mc2"
+
+[[warpscript_probes.apps]]
+id = "app_frontend"
+warp_token = "TOKEN_FRONTEND"  # Optional custom token
+
+[[warpscript_probes.apps]]
+id = "app_backend"
+warp_token = "TOKEN_BACKEND"
+
+[[warpscript_probes.apps]]
+id = "app_worker"
+# No warp_token: uses WARP_TOKEN env var
+
+[[warpscript_probes.levels]]
+level = 1
+scale_up_threshold = 70.0
+upscale_command = "clever scale --app ${APP_ID} --min-instances 2"
+```
+
+**How it works:**
+- **Probe Expansion**: The configuration above creates **3 independent probes**:
+  - "Multi-App Scaler - app_frontend" (uses TOKEN_FRONTEND)
+  - "Multi-App Scaler - app_backend" (uses TOKEN_BACKEND)
+  - "Multi-App Scaler - app_worker" (uses WARP_TOKEN env var)
+- **Independent State**: Each probe has its own:
+  - Current scaling level
+  - Last metric value
+  - State persistence
+  - Optional custom Warp token
+- **Substitution**: In each probe instance:
+  - `${APP_ID}` in WarpScript → replaced with specific app id (e.g., `app_frontend`)
+  - `${APP_ID}` in commands → replaced with specific app id
+  - `${WARP_TOKEN}` in WarpScript → replaced with app's custom token or WARP_TOKEN env var
+
+**Benefits:**
+- Avoid configuration duplication for similar apps
+- Each app scales independently based on its own metrics
+- Each app can use its own Warp token (for multi-tenant scenarios)
+- Consistent scaling policies across multiple apps
+- Each app can be at a different scaling level
+
+#### Benefits
+
+- Automatic horizontal/vertical scaling based on real metrics
+- Gradual scale up/down to prevent over-provisioning
+- State persistence ensures correct level after restarts
+- Flexible WarpScript queries for any Warp 10 metric
+- Works with any platform (Kubernetes, Clever Cloud, etc.)
 
 ### Redis Persistence (Optional)
 

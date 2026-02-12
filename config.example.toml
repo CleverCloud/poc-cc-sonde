@@ -78,3 +78,35 @@ expected_body_regex = "\"url\":\\s*\"https://httpbin.org/get\""
 #
 # [probes.checks]
 # expected_status = 200  # This will fail since the endpoint returns 500
+
+# ============================================================================
+# WarpScript Probes (requires WARP_ENDPOINT and WARP_TOKEN environment vars)
+# ============================================================================
+
+# Example 7: WarpScript-based auto-scaling probe
+# Uncomment to use (and set WARP_ENDPOINT and WARP_TOKEN env vars)
+# [[warpscript_probes]]
+# name = "CPU Auto-Scaler"
+# warpscript_file = "warpscript/cpu_usage.mc2"
+# interval_seconds = 60
+# delay_after_scale_seconds = 120
+#
+# # Level 1: Minimum (1 instance)
+# [[warpscript_probes.levels]]
+# level = 1
+# scale_up_threshold = 70.0
+# upscale_command = "kubectl scale deployment myapp --replicas=2"
+#
+# # Level 2: Medium (2 instances)
+# [[warpscript_probes.levels]]
+# level = 2
+# scale_up_threshold = 85.0
+# scale_down_threshold = 50.0
+# upscale_command = "kubectl scale deployment myapp --replicas=3"
+# downscale_command = "kubectl scale deployment myapp --replicas=1"
+#
+# # Level 3: Maximum (3 instances)
+# [[warpscript_probes.levels]]
+# level = 3
+# scale_down_threshold = 60.0
+# downscale_command = "kubectl scale deployment myapp --replicas=2"

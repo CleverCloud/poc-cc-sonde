@@ -4,10 +4,12 @@ mod healthcheck;
 mod persistence;
 mod probe;
 mod scheduler;
+mod warpscript_probe;
+mod warpscript_scheduler;
 
 use clap::Parser;
 use std::env;
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -85,9 +87,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = config::Config::from_file(&args.config)?;
 
     info!(
-        probe_count = config.probes.len(),
+        http_probe_count = config.probes.len(),
+        warpscript_probe_count = config.warpscript_probes.len(),
         "Configuration loaded successfully"
     );
+
+    // Check WarpScript environment variables if WarpScript probes are configured
+    if !config.warpscript_probes.is_empty() {
+        match (env::var("WARP_ENDPOINT"), env::var("WARP_TOKEN")) {
+            (Ok(endpoint), Ok(_)) => {
+                info!(
+                    warp_endpoint = %endpoint,
+                    "WarpScript environment configured"
+                );
+            }
+            (Err(_), _) => {
+                error!("WARP_ENDPOINT environment variable not set, but WarpScript probes are configured");
+                return Err("Missing WARP_ENDPOINT environment variable".into());
+            }
+            (_, Err(_)) => {
+                error!("WARP_TOKEN environment variable not set, but WarpScript probes are configured");
+                return Err("Missing WARP_TOKEN environment variable".into());
+            }
+        }
+    }
 
     // Initialize persistence backend
     let redis_url = get_redis_url();
@@ -128,6 +151,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let backend_clone = backend.clone();
         let handle = tokio::spawn(scheduler::schedule_probe(probe, backend_clone));
         handles.push(handle);
+    }
+
+    // Spawn a task for each WarpScript probe
+    // If apps is specified, create one probe instance per app
+    for probe in config.warpscript_probes {
+        if probe.apps.is_empty() {
+            // No apps: create a single probe as-is
+            info!(
+                probe_name = %probe.name,
+                warpscript_file = %probe.warpscript_file,
+                interval_seconds = probe.interval_seconds,
+                levels_count = probe.levels.len(),
+                "Spawning WarpScript probe task"
+            );
+
+            let backend_clone = backend.clone();
+            let handle = tokio::spawn(warpscript_scheduler::schedule_warpscript_probe(probe, backend_clone));
+            handles.push(handle);
+        } else {
+            // With apps: create one probe instance per app
+            let apps_count = probe.apps.len();
+            info!(
+                probe_name = %probe.name,
+                apps_count = apps_count,
+                "Expanding WarpScript probe for each app"
+            );
+
+            for app in &probe.apps {
+                let mut probe_instance = probe.clone();
+                // Update probe name to include app_id
+                probe_instance.name = format!("{} - {}", probe.name, app.id);
+                // Keep only this app
+                probe_instance.apps = vec![app.clone()];
+
+                info!(
+                    probe_name = %probe_instance.name,
+                    app_id = %app.id,
+                    has_custom_token = app.warp_token.is_some(),
+                    warpscript_file = %probe_instance.warpscript_file,
+                    interval_seconds = probe_instance.interval_seconds,
+                    levels_count = probe_instance.levels.len(),
+                    "Spawning WarpScript probe instance"
+                );
+
+                let backend_clone = backend.clone();
+                let handle = tokio::spawn(warpscript_scheduler::schedule_warpscript_probe(probe_instance, backend_clone));
+                handles.push(handle);
+            }
+        }
     }
 
     info!("All probe tasks spawned, waiting for shutdown signal");

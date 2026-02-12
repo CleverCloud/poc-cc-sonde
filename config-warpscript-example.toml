@@ -1,0 +1,149 @@
+# Example configuration for WarpScript-based auto-scaling probes
+# Requires environment variables:
+# - WARP_ENDPOINT: URL of Warp API (e.g., https://warp.example.com/api/v0/exec)
+# - WARP_TOKEN: Authentication token for Warp
+
+# Example 1: CPU-based auto-scaling with 3 levels and custom tokens per app
+[[warpscript_probes]]
+name = "CPU Auto-Scaler"
+warpscript_file = "warpscript/cpu_usage.mc2"
+interval_seconds = 60
+command_timeout_seconds = 45
+# Optional: custom delay after scaling (defaults to interval_seconds)
+delay_after_scale_seconds = 120  # Wait 2 minutes after scaling before next check
+
+# Define apps with optional custom warp_token
+[[warpscript_probes.apps]]
+id = "app_frontend"
+warp_token = "READ_TOKEN_FOR_FRONTEND"  # Optional: custom token for this app
+
+[[warpscript_probes.apps]]
+id = "app_backend"
+# warp_token not specified: will use WARP_TOKEN env var
+
+# Level 1: Minimum scale (1 replica)
+[[warpscript_probes.levels]]
+level = 1
+scale_up_threshold = 70.0          # If CPU > 70%, scale up to level 2
+# No scale_down_threshold needed (can't go below level 1)
+upscale_command = "kubectl scale deployment myapp --replicas=2"
+# downscale_command ignored at minimum level
+
+# Level 2: Medium scale (2 replicas)
+[[warpscript_probes.levels]]
+level = 2
+scale_up_threshold = 80.0          # If CPU > 80%, scale up to level 3
+scale_down_threshold = 50.0        # If CPU < 50%, scale down to level 1
+upscale_command = "kubectl scale deployment myapp --replicas=3"
+downscale_command = "kubectl scale deployment myapp --replicas=1"
+
+# Level 3: Maximum scale (3 replicas)
+[[warpscript_probes.levels]]
+level = 3
+# No scale_up_threshold needed (already at max)
+scale_down_threshold = 60.0        # If CPU < 60%, scale down to level 2
+# upscale_command ignored at maximum level
+downscale_command = "kubectl scale deployment myapp --replicas=2"
+
+# Example 2: Memory-based scaling with 4 levels using multiple apps
+[[warpscript_probes]]
+name = "Memory Auto-Scaler"
+warpscript_file = "warpscript/memory_usage.mc2"
+interval_seconds = 120
+delay_after_scale_seconds = 180  # Wait 3 minutes after scaling
+
+# Each app can have its own token
+[[warpscript_probes.apps]]
+id = "app_frontend"
+warp_token = "TOKEN_FRONTEND"
+
+[[warpscript_probes.apps]]
+id = "app_backend"
+warp_token = "TOKEN_BACKEND"
+
+[[warpscript_probes.apps]]
+id = "app_worker"
+warp_token = "TOKEN_WORKER"
+
+[[warpscript_probes.levels]]
+level = 1
+scale_up_threshold = 60.0
+upscale_command = "clever scale --app ${APP_ID} --flavor S"
+
+[[warpscript_probes.levels]]
+level = 2
+scale_up_threshold = 75.0
+scale_down_threshold = 45.0
+upscale_command = "clever scale --app ${APP_ID} --flavor M"
+downscale_command = "clever scale --app ${APP_ID} --flavor XS"
+
+[[warpscript_probes.levels]]
+level = 3
+scale_up_threshold = 85.0
+scale_down_threshold = 55.0
+upscale_command = "clever scale --app ${APP_ID} --flavor L"
+downscale_command = "clever scale --app ${APP_ID} --flavor S"
+
+[[warpscript_probes.levels]]
+level = 4
+scale_down_threshold = 65.0
+downscale_command = "clever scale --app ${APP_ID} --flavor M"
+
+# Example 3: Request rate based scaling
+[[warpscript_probes]]
+name = "Request Rate Scaler"
+warpscript_file = "warpscript/request_rate.mc2"
+interval_seconds = 30
+delay_after_scale_seconds = 60
+
+[[warpscript_probes.levels]]
+level = 1
+scale_up_threshold = 100.0  # > 100 req/s
+upscale_command = "kubectl scale deployment api --replicas=2"
+
+[[warpscript_probes.levels]]
+level = 2
+scale_up_threshold = 250.0  # > 250 req/s
+scale_down_threshold = 80.0 # < 80 req/s
+upscale_command = "kubectl scale deployment api --replicas=4"
+downscale_command = "kubectl scale deployment api --replicas=1"
+
+[[warpscript_probes.levels]]
+level = 3
+scale_up_threshold = 500.0  # > 500 req/s
+scale_down_threshold = 200.0  # < 200 req/s
+upscale_command = "kubectl scale deployment api --replicas=8"
+downscale_command = "kubectl scale deployment api --replicas=2"
+
+[[warpscript_probes.levels]]
+level = 4
+scale_down_threshold = 400.0  # < 400 req/s
+downscale_command = "kubectl scale deployment api --replicas=4"
+
+# How it works:
+# 1. WarpScript executes periodically and returns a numeric value
+# 2. The value is compared against thresholds of the CURRENT level
+# 3. If value > scale_up_threshold of current level → UPSCALE (level++)
+#    - Execute upscale_command of current level
+#    - Move to next level (current_level + 1)
+# 4. If value < scale_down_threshold of current level → DOWNSCALE (level--)
+#    - Execute downscale_command of current level
+#    - Move to previous level (current_level - 1)
+# 5. At min level (1): downscale is ignored
+# 6. At max level (N): upscale is ignored
+# 7. Current level is persisted in Redis/memory
+
+# Scaling strategy tips:
+# - Set scale_down_threshold lower than scale_up_threshold to avoid flapping
+# - Use delay_after_scale_seconds to stabilize after scaling actions
+# - Define clear hysteresis between thresholds (e.g., up at 70%, down at 50%)
+#
+# Application Configuration (apps):
+# - Define a list of applications to avoid duplicating configuration
+# - Each app automatically creates an independent probe instance
+# - Each instance has its own name (e.g., "CPU Auto-Scaler - app_frontend")
+# - Each instance maintains its own state and current level
+# - Each app can have its own warp_token (optional, falls back to WARP_TOKEN env var)
+# - In WarpScript files: ${APP_ID} is replaced with the specific app id
+# - In commands: ${APP_ID} is replaced with the specific app id
+# - This is like a template that expands into multiple independent probes
