@@ -87,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = config::Config::from_file(&args.config)?;
 
     info!(
-        http_probe_count = config.probes.len(),
+        http_probe_count = config.healthcheck_probes.len(),
         warpscript_probe_count = config.warpscript_probes.len(),
         "Configuration loaded successfully"
     );
@@ -129,20 +129,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // Spawn a task for each probe
+    // Spawn a task for each healthcheck probe
+    // If apps is specified, create one probe instance per app
     let mut handles = vec![];
 
-    for probe in config.probes {
-        info!(
-            probe_name = %probe.name,
-            url = %probe.url,
-            interval_seconds = probe.interval_seconds,
-            "Spawning probe task"
-        );
+    for probe in config.healthcheck_probes {
+        if probe.apps.is_empty() {
+            // No apps: single probe with direct url
+            info!(
+                probe_name = %probe.name,
+                url = %probe.url.as_deref().unwrap_or(""),
+                interval_seconds = probe.interval_seconds,
+                "Spawning healthcheck probe task"
+            );
 
-        let backend_clone = backend.clone();
-        let handle = tokio::spawn(scheduler::schedule_probe(probe, backend_clone));
-        handles.push(handle);
+            let backend_clone = backend.clone();
+            let handle = tokio::spawn(scheduler::schedule_probe(probe, backend_clone));
+            handles.push(handle);
+        } else {
+            // With apps: create one probe instance per app
+            let apps_count = probe.apps.len();
+            info!(
+                probe_name = %probe.name,
+                apps_count = apps_count,
+                "Expanding healthcheck probe for each app"
+            );
+
+            for app in &probe.apps {
+                let mut probe_instance = probe.clone();
+                probe_instance.name = format!("{} - {}", probe.name, app.id);
+                probe_instance.url = Some(app.url.clone());
+                probe_instance.apps = vec![app.clone()];
+
+                info!(
+                    probe_name = %probe_instance.name,
+                    app_id = %app.id,
+                    url = %app.url,
+                    interval_seconds = probe_instance.interval_seconds,
+                    "Spawning healthcheck probe instance"
+                );
+
+                let backend_clone = backend.clone();
+                let handle = tokio::spawn(scheduler::schedule_probe(probe_instance, backend_clone));
+                handles.push(handle);
+            }
+        }
     }
 
     // Spawn a task for each WarpScript probe

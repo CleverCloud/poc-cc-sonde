@@ -98,6 +98,14 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) 
                     let retry_threshold = probe.get_failure_retries_before_command();
 
                     if consecutive_failures > retry_threshold {
+                        // Substitute ${APP_ID} if an app is configured
+                        let app_id = probe.apps.first().map(|a| a.id.as_str());
+                        let command = if let Some(id) = app_id {
+                            command.replace("${APP_ID}", id)
+                        } else {
+                            command.clone()
+                        };
+
                         info!(
                             probe_name = %probe.name,
                             command = %command,
@@ -106,7 +114,7 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) 
                             "Failure threshold reached, executing command"
                         );
 
-                        match executor::execute_command(command, probe.command_timeout_seconds).await {
+                        match executor::execute_command(&command, probe.command_timeout_seconds).await {
                             Ok(output) => {
                                 if output.status.success() {
                                     info!(

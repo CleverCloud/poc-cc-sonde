@@ -55,35 +55,35 @@ cargo build --release --features redis-persistence
 Create a `config.toml` file with your probe configurations. See the example below:
 
 ```toml
-[[probes]]
+[[healthcheck_probes]]
 name = "API Health Check"
 url = "https://api.example.com/health"
 interval_seconds = 60
 on_failure_command = "systemctl restart my-service"
 command_timeout_seconds = 30  # Optional, defaults to 30
 
-[probes.checks]
+[healthcheck_probes.checks]
 expected_status = 200
 expected_body_contains = "\"status\":\"ok\""
 
-[[probes]]
+[[healthcheck_probes]]
 name = "Service with Header Check"
 url = "https://service.example.com/status"
 interval_seconds = 30
 
-[probes.checks]
+[healthcheck_probes.checks]
 expected_status = 200
 
-[probes.checks.expected_header]
+[healthcheck_probes.checks.expected_header]
 "X-Service-Status" = "healthy"
 "Content-Type" = "application/json"
 
-[[probes]]
+[[healthcheck_probes]]
 name = "Regex Pattern Check"
 url = "https://api.example.com/version"
 interval_seconds = 120
 
-[probes.checks]
+[healthcheck_probes.checks]
 expected_status = 200
 expected_body_regex = "\"version\":\\s*\"\\d+\\.\\d+\\.\\d+\""
 ```
@@ -178,7 +178,7 @@ curl http://localhost:8080
 Configure different delays after success or failure to implement retry strategies:
 
 ```toml
-[[probes]]
+[[healthcheck_probes]]
 name = "Critical API"
 url = "https://api.example.com/health"
 interval_seconds = 300              # Default interval (5 minutes)
@@ -186,7 +186,7 @@ delay_after_success_seconds = 300   # Continue checking every 5 minutes when hea
 delay_after_failure_seconds = 30    # Fast retry: check every 30 seconds when unhealthy
 on_failure_command = "echo 'API down, checking every 30s'"
 
-[probes.checks]
+[healthcheck_probes.checks]
 expected_status = 200
 ```
 
@@ -200,7 +200,7 @@ expected_status = 200
 Avoid false alerts by requiring multiple consecutive failures before executing the failure command:
 
 ```toml
-[[probes]]
+[[healthcheck_probes]]
 name = "API with Transient Issues"
 url = "https://api.example.com/health"
 interval_seconds = 60
@@ -208,7 +208,7 @@ delay_after_failure_seconds = 10            # Retry every 10 seconds on failure
 failure_retries_before_command = 3          # Only execute command after 3 consecutive failures
 on_failure_command = "alert-admin.sh"
 
-[probes.checks]
+[healthcheck_probes.checks]
 expected_status = 200
 ```
 
@@ -539,13 +539,13 @@ The application produces structured logs with the following information:
 ### Example 1: Monitor API Health
 
 ```toml
-[[probes]]
+[[healthcheck_probes]]
 name = "Production API"
 url = "https://api.myapp.com/health"
 interval_seconds = 30
 on_failure_command = "curl -X POST https://hooks.slack.com/... -d '{\"text\":\"API is down!\"}'"
 
-[probes.checks]
+[healthcheck_probes.checks]
 expected_status = 200
 expected_body_contains = "healthy"
 ```
@@ -553,25 +553,25 @@ expected_body_contains = "healthy"
 ### Example 2: Monitor Service with Auto-Restart
 
 ```toml
-[[probes]]
+[[healthcheck_probes]]
 name = "Backend Service"
 url = "http://localhost:8080/status"
 interval_seconds = 60
 on_failure_command = "systemctl restart myservice"
 
-[probes.checks]
+[healthcheck_probes.checks]
 expected_status = 200
 ```
 
 ### Example 3: Validate API Response Format
 
 ```toml
-[[probes]]
+[[healthcheck_probes]]
 name = "User API"
 url = "https://api.myapp.com/users/1"
 interval_seconds = 120
 
-[probes.checks]
+[healthcheck_probes.checks]
 expected_status = 200
 expected_body_regex = "\\{\"id\":\\s*\\d+,\\s*\"name\":\\s*\".+\"\\}"
 ```
@@ -594,10 +594,10 @@ cargo test test_valid_config
 ### Configuration Errors
 
 If you see "Configuration must contain at least one probe":
-- Ensure your `config.toml` has at least one `[[probes]]` section
+- Ensure your `config.toml` has at least one `[[healthcheck_probes]]` section
 
 If you see "Probe has no checks configured":
-- Add at least one check type to `[probes.checks]`
+- Add at least one check type to `[healthcheck_probes.checks]`
 
 ### Network Errors
 

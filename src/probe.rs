@@ -50,10 +50,11 @@ impl std::fmt::Display for CheckFailure {
 }
 
 pub async fn execute_probe(probe: &Probe) -> Result<bool, CheckFailure> {
+    let url = probe.url.as_deref().unwrap_or("");
     let start = Instant::now();
     info!(
         probe_name = %probe.name,
-        url = %probe.url,
+        url = %url,
         "Starting HTTP probe"
     );
 
@@ -66,12 +67,12 @@ pub async fn execute_probe(probe: &Probe) -> Result<bool, CheckFailure> {
         })?;
 
     // Execute HTTP request
-    let response = match client.get(&probe.url).send().await {
+    let response = match client.get(url).send().await {
         Ok(resp) => resp,
         Err(e) => {
             error!(
                 probe_name = %probe.name,
-                url = %probe.url,
+                url = %url,
                 error = %e,
                 "HTTP request failed"
             );
@@ -86,7 +87,7 @@ pub async fn execute_probe(probe: &Probe) -> Result<bool, CheckFailure> {
 
     info!(
         probe_name = %probe.name,
-        url = %probe.url,
+        url = %url,
         status = status,
         duration_ms = duration.as_millis(),
         "Received HTTP response"
@@ -182,7 +183,7 @@ pub async fn execute_probe(probe: &Probe) -> Result<bool, CheckFailure> {
     // Check headers (need to re-fetch if we consumed body)
     if let Some(ref expected_headers) = probe.checks.expected_header {
         // Re-fetch to get headers (since we consumed the response for body checks)
-        let response = match client.get(&probe.url).send().await {
+        let response = match client.get(url).send().await {
             Ok(resp) => resp,
             Err(e) => {
                 return Err(CheckFailure::RequestError {
@@ -251,7 +252,7 @@ mod tests {
 
         let probe = Probe {
             name: "Test".to_string(),
-            url: server.url(),
+            url: Some(server.url()),
             interval_seconds: 1,
             checks: Checks {
                 expected_status: Some(200),
@@ -264,6 +265,7 @@ mod tests {
             delay_after_success_seconds: None,
             delay_after_failure_seconds: None,
             failure_retries_before_command: None,
+            apps: vec![],
         };
 
         let result = execute_probe(&probe).await;

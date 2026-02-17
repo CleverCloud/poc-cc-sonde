@@ -5,7 +5,7 @@ use std::path::Path;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
-    pub probes: Vec<Probe>,
+    pub healthcheck_probes: Vec<Probe>,
     #[serde(default)]
     pub warpscript_probes: Vec<WarpScriptProbe>,
 }
@@ -13,7 +13,8 @@ pub struct Config {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Probe {
     pub name: String,
-    pub url: String,
+    /// Direct URL (used when no apps are defined)
+    pub url: Option<String>,
     pub interval_seconds: u64,
     pub checks: Checks,
     pub on_failure_command: Option<String>,
@@ -25,6 +26,17 @@ pub struct Probe {
     pub delay_after_failure_seconds: Option<u64>,
     /// Number of consecutive failures before executing the failure command (defaults to 0 = execute immediately)
     pub failure_retries_before_command: Option<u32>,
+    /// Applications to monitor (each app creates an independent probe instance)
+    #[serde(default)]
+    pub apps: Vec<HealthCheckApp>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct HealthCheckApp {
+    /// Application ID (substituted as ${APP_ID} in commands)
+    pub id: String,
+    /// Health check URL for this specific app
+    pub url: String,
 }
 
 impl Probe {
@@ -150,16 +162,20 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.probes.is_empty() {
+        if self.healthcheck_probes.is_empty() {
             return Err("Configuration must contain at least one probe".into());
         }
 
-        for probe in &self.probes {
+        for probe in &self.healthcheck_probes {
             if probe.name.is_empty() {
                 return Err("Probe name cannot be empty".into());
             }
-            if probe.url.is_empty() {
-                return Err(format!("Probe '{}' has empty URL", probe.name).into());
+            // Either url or apps must be specified
+            if probe.url.is_none() && probe.apps.is_empty() {
+                return Err(format!("Probe '{}' must have either 'url' or 'apps' configured", probe.name).into());
+            }
+            if probe.url.is_some() && !probe.apps.is_empty() {
+                return Err(format!("Probe '{}' cannot have both 'url' and 'apps' configured", probe.name).into());
             }
             if probe.interval_seconds == 0 {
                 return Err(format!("Probe '{}' has invalid interval (must be > 0)", probe.name).into());
@@ -192,12 +208,12 @@ mod tests {
     #[test]
     fn test_valid_config() {
         let toml_content = r#"
-            [[probes]]
+            [[healthcheck_probes]]
             name = "Test Probe"
             url = "https://example.com"
             interval_seconds = 60
 
-            [probes.checks]
+            [healthcheck_probes.checks]
             expected_status = 200
         "#;
 
@@ -208,7 +224,7 @@ mod tests {
     #[test]
     fn test_empty_probes() {
         let toml_content = r#"
-            probes = []
+            healthcheck_probes = []
         "#;
 
         let config: Config = toml::from_str(toml_content).unwrap();
@@ -218,12 +234,12 @@ mod tests {
     #[test]
     fn test_no_checks() {
         let toml_content = r#"
-            [[probes]]
+            [[healthcheck_probes]]
             name = "Test"
             url = "https://example.com"
             interval_seconds = 60
 
-            [probes.checks]
+            [healthcheck_probes.checks]
         "#;
 
         let config: Config = toml::from_str(toml_content).unwrap();

@@ -13,16 +13,12 @@ pub async fn execute_command(
         "Executing failure command"
     );
 
-    // Split command into program and args
-    let parts: Vec<&str> = command.split_whitespace().collect();
-    if parts.is_empty() {
+    if command.trim().is_empty() {
         return Err("Empty command".into());
     }
 
-    let (program, args) = (parts[0], &parts[1..]);
-
-    // Execute command with timeout
-    let child = Command::new(program).args(args).output();
+    // Execute through shell to support &&, ||, ;, pipes, etc.
+    let child = Command::new("sh").args(["-c", command]).output();
 
     let output = match tokio::time::timeout(Duration::from_secs(timeout_seconds), child).await {
         Ok(Ok(output)) => output,
