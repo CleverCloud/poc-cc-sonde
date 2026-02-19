@@ -76,15 +76,29 @@ pub async fn schedule_warpscript_probe(probe: WarpScriptProbe, backend: Arc<dyn 
     // Load previous state if exists
     let previous_state = backend.load_warpscript_state(&probe.name).await.ok().flatten();
 
-    let mut current_level = match &previous_state {
+    let (mut current_level, mut next_delay) = match &previous_state {
         Some(state) => {
-            info!(
-                probe_name = %probe.name,
-                current_level = state.current_level,
-                last_value = state.last_value,
-                "Resuming WarpScript probe from saved state"
-            );
-            state.current_level
+            let now = persistence::current_timestamp();
+            let delay = if state.next_check_timestamp > now {
+                let remaining = state.next_check_timestamp - now;
+                info!(
+                    probe_name = %probe.name,
+                    remaining_seconds = remaining,
+                    current_level = state.current_level,
+                    last_value = state.last_value,
+                    "Resuming WarpScript probe from saved state"
+                );
+                remaining
+            } else {
+                info!(
+                    probe_name = %probe.name,
+                    current_level = state.current_level,
+                    last_value = state.last_value,
+                    "Saved state expired, starting immediately"
+                );
+                0
+            };
+            (state.current_level, delay)
         }
         None => {
             // Start at minimum level
@@ -92,13 +106,11 @@ pub async fn schedule_warpscript_probe(probe: WarpScriptProbe, backend: Arc<dyn 
             info!(
                 probe_name = %probe.name,
                 initial_level = initial_level,
-                "No previous state found, starting at minimum level"
+                "No previous state found, starting immediately"
             );
-            initial_level
+            (initial_level, 0)
         }
     };
-
-    let mut next_delay = 0u64;
 
     loop {
         // Wait for the calculated delay
