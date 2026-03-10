@@ -53,14 +53,28 @@ fn get_redis_url() -> Option<String> {
     None
 }
 
-/// Mask password in Redis URL for safe logging
+/// Mask password in Redis URL for safe logging.
+/// Handles both redis://:password@host and redis://user:password@host formats.
 fn mask_redis_password(url: &str) -> String {
-    // Match pattern: redis://:PASSWORD@host:port
-    if let Some(idx) = url.find("://:") {
-        if let Some(end_idx) = url[idx + 4..].find('@') {
-            let mut masked = url.to_string();
-            masked.replace_range(idx + 4..idx + 4 + end_idx, "****");
-            return masked;
+    // Find the authority section: after "://" and before the next "/"
+    if let Some(scheme_end) = url.find("://") {
+        let rest = &url[scheme_end + 3..];
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        let authority = &rest[..authority_end];
+
+        // Password is present only when there is an '@' in the authority
+        if let Some(at_pos) = authority.rfind('@') {
+            let user_info = &authority[..at_pos];
+            // Password starts after the first ':' in user_info (covers both ":pass" and "user:pass")
+            if let Some(colon_pos) = user_info.find(':') {
+                let password_start = scheme_end + 3 + colon_pos + 1;
+                let password_end = scheme_end + 3 + at_pos;
+                if password_start < password_end {
+                    let mut masked = url.to_string();
+                    masked.replace_range(password_start..password_end, "****");
+                    return masked;
+                }
+            }
         }
     }
     url.to_string()

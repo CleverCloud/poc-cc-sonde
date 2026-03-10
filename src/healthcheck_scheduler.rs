@@ -8,6 +8,14 @@ use tokio::time;
 use tracing::{debug, error, info};
 
 pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) {
+    // Build the HTTP client once and reuse across all iterations
+    let client = match healthcheck_probe::build_client() {
+        Ok(c) => c,
+        Err(e) => {
+            error!(probe_name = %probe.name, error = %e, "Failed to build HTTP client");
+            return;
+        }
+    };
     info!(
         probe_name = %probe.name,
         interval_seconds = probe.interval_seconds,
@@ -74,7 +82,7 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) 
         );
 
         let check_timestamp = persistence::current_timestamp();
-        let (success, command_executed, command_succeeded) = match healthcheck_probe::execute_probe(&probe).await {
+        let (success, command_executed, command_succeeded) = match healthcheck_probe::execute_probe(&probe, &client).await {
             Ok(_) => {
                 info!(
                     probe_name = %probe.name,

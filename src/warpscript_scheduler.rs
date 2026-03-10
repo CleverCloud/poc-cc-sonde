@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info};
 
+
 /// Execute a command with app_id substitution
 async fn execute_scaling_command(
     probe_name: &str,
@@ -55,6 +56,15 @@ async fn execute_scaling_command(
 }
 
 pub async fn schedule_warpscript_probe(probe: WarpScriptProbe, backend: Arc<dyn PersistenceBackend>) {
+    // Build the HTTP client once and reuse across all iterations
+    let client = match warpscript_probe::build_client() {
+        Ok(c) => c,
+        Err(e) => {
+            error!(probe_name = %probe.name, error = %e, "Failed to build HTTP client");
+            return;
+        }
+    };
+
     info!(
         probe_name = %probe.name,
         interval_seconds = probe.interval_seconds,
@@ -137,7 +147,7 @@ pub async fn schedule_warpscript_probe(probe: WarpScriptProbe, backend: Arc<dyn 
         let custom_token = app.and_then(|a| a.warp_token.as_deref());
 
         // Execute WarpScript and get value
-        let value = match warpscript_probe::execute_warpscript(&probe.name, &probe.warpscript_file, app_id, custom_token).await {
+        let value = match warpscript_probe::execute_warpscript(&probe.name, &probe.warpscript_file, app_id, custom_token, &client).await {
             Ok(v) => {
                 info!(
                     probe_name = %probe.name,

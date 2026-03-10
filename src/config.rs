@@ -221,6 +221,21 @@ impl WarpScriptProbe {
     }
 }
 
+/// Validates that an app ID contains only safe characters (alphanumeric, `-`, `_`, `.`).
+/// This prevents shell injection when APP_ID is substituted into sh -c commands.
+fn validate_app_id(probe_name: &str, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if id.is_empty() {
+        return Err(format!("Probe '{}': app id cannot be empty", probe_name).into());
+    }
+    if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        return Err(format!(
+            "Probe '{}': app id '{}' contains invalid characters (only alphanumeric, '-', '_', '.' allowed)",
+            probe_name, id
+        ).into());
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let contents = fs::read_to_string(path)?;
@@ -233,6 +248,9 @@ impl Config {
         if self.healthcheck_probes.is_empty() {
             return Err("Configuration must contain at least one probe".into());
         }
+
+        // Validate uniqueness of effective probe names (post-app expansion)
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for probe in &self.healthcheck_probes {
             if probe.name.is_empty() {
@@ -263,6 +281,21 @@ impl Config {
                 regex::Regex::new(pattern)
                     .map_err(|e| format!("Probe '{}' has invalid regex: {}", probe.name, e))?;
             }
+
+            // Validate effective names (after app expansion) are unique
+            let effective_names: Vec<String> = if probe.apps.is_empty() {
+                vec![probe.name.clone()]
+            } else {
+                probe.apps.iter().map(|a| {
+                    validate_app_id(&probe.name, &a.id)?;
+                    Ok(format!("{} - {}", probe.name, a.id))
+                }).collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
+            };
+            for name in effective_names {
+                if !seen_names.insert(name.clone()) {
+                    return Err(format!("Duplicate effective probe name: '{}'", name).into());
+                }
+            }
         }
 
         for probe in &self.warpscript_probes {
@@ -284,6 +317,21 @@ impl Config {
                         probe.name, level.level
                     )
                     .into());
+                }
+            }
+
+            // Validate effective names (after app expansion) are unique
+            let effective_names: Vec<String> = if probe.apps.is_empty() {
+                vec![probe.name.clone()]
+            } else {
+                probe.apps.iter().map(|a| {
+                    validate_app_id(&probe.name, &a.id)?;
+                    Ok(format!("{} - {}", probe.name, a.id))
+                }).collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
+            };
+            for name in effective_names {
+                if !seen_names.insert(name.clone()) {
+                    return Err(format!("Duplicate effective probe name: '{}'", name).into());
                 }
             }
         }

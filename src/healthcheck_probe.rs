@@ -4,6 +4,12 @@ use reqwest::Client;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
+pub fn build_client() -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+}
+
 #[derive(Debug)]
 pub enum CheckFailure {
     Status { expected: u16, actual: u16 },
@@ -49,7 +55,7 @@ impl std::fmt::Display for CheckFailure {
     }
 }
 
-pub async fn execute_probe(probe: &Probe) -> Result<bool, CheckFailure> {
+pub async fn execute_probe(probe: &Probe, client: &Client) -> Result<bool, CheckFailure> {
     let url = probe.url.as_deref().unwrap_or("");
     let start = Instant::now();
     info!(
@@ -57,14 +63,6 @@ pub async fn execute_probe(probe: &Probe) -> Result<bool, CheckFailure> {
         url = %url,
         "Starting HTTP probe"
     );
-
-    // Create HTTP client
-    let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| CheckFailure::RequestError {
-            error: e.to_string(),
-        })?;
 
     // Execute HTTP request
     let response = match client.get(url).send().await {
@@ -84,6 +82,8 @@ pub async fn execute_probe(probe: &Probe) -> Result<bool, CheckFailure> {
 
     let duration = start.elapsed();
     let status = response.status().as_u16();
+    // Save headers before consuming the response body — avoids a second HTTP request
+    let headers = response.headers().clone();
 
     info!(
         probe_name = %probe.name,
@@ -180,21 +180,10 @@ pub async fn execute_probe(probe: &Probe) -> Result<bool, CheckFailure> {
         );
     }
 
-    // Check headers (need to re-fetch if we consumed body)
+    // Check headers from the saved first response — no second HTTP request needed
     if let Some(ref expected_headers) = probe.checks.expected_header {
-        // Re-fetch to get headers (since we consumed the response for body checks)
-        let response = match client.get(url).send().await {
-            Ok(resp) => resp,
-            Err(e) => {
-                return Err(CheckFailure::RequestError {
-                    error: e.to_string(),
-                });
-            }
-        };
-
         for (key, expected_value) in expected_headers {
-            let actual_value = response
-                .headers()
+            let actual_value = headers
                 .get(key)
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
@@ -270,7 +259,8 @@ mod tests {
             apps: vec![],
         };
 
-        let result = execute_probe(&probe).await;
+        let client = build_client().unwrap();
+        let result = execute_probe(&probe, &client).await;
         assert!(result.is_ok());
         mock.assert_async().await;
     }

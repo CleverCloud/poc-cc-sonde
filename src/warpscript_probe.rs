@@ -1,6 +1,13 @@
+use reqwest::Client;
 use std::env;
 use std::fs;
 use tracing::{debug, error, info};
+
+pub fn build_client() -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+}
 
 #[derive(Debug)]
 pub enum WarpScriptError {
@@ -33,6 +40,7 @@ pub async fn execute_warpscript(
     warpscript_file: &str,
     app_id: Option<&str>,
     custom_token: Option<&str>,
+    client: &Client,
 ) -> Result<f64, WarpScriptError> {
     // Read environment variables
     let endpoint = env::var("WARP_ENDPOINT")
@@ -72,12 +80,6 @@ pub async fn execute_warpscript(
         app_id = ?app_id,
         "Token and app_id substitution completed"
     );
-
-    // Execute WarpScript via HTTP POST
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| WarpScriptError::RequestError(e.to_string()))?;
 
     info!(
         probe_name = %probe_name,
