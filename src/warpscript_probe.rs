@@ -1,6 +1,5 @@
 use reqwest::Client;
 use std::env;
-use std::fs;
 use tracing::{debug, error, info};
 
 pub fn build_client() -> Result<Client, reqwest::Error> {
@@ -11,7 +10,6 @@ pub fn build_client() -> Result<Client, reqwest::Error> {
 
 #[derive(Debug)]
 pub enum WarpScriptError {
-    FileReadError(std::io::Error),
     MissingEndpoint,
     MissingToken,
     RequestError(String),
@@ -22,7 +20,6 @@ pub enum WarpScriptError {
 impl std::fmt::Display for WarpScriptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WarpScriptError::FileReadError(e) => write!(f, "Failed to read WarpScript file: {}", e),
             WarpScriptError::MissingEndpoint => write!(f, "WARP_ENDPOINT environment variable not set"),
             WarpScriptError::MissingToken => write!(f, "warp_token not configured for this app and WARP_TOKEN environment variable not set"),
             WarpScriptError::RequestError(e) => write!(f, "Warp API request failed: {}", e),
@@ -34,35 +31,24 @@ impl std::fmt::Display for WarpScriptError {
 
 impl std::error::Error for WarpScriptError {}
 
-/// Execute a WarpScript file and return the scalar value
+/// Execute a WarpScript and return the scalar value.
+/// `script` is the script content (read once by the caller).
 pub async fn execute_warpscript(
     probe_name: &str,
-    warpscript_file: &str,
+    script: &str,
     app_id: Option<&str>,
     custom_token: Option<&str>,
     client: &Client,
 ) -> Result<f64, WarpScriptError> {
     // Read environment variables
-    let endpoint = env::var("WARP_ENDPOINT")
-        .map_err(|_| WarpScriptError::MissingEndpoint)?;
+    let endpoint = env::var("WARP_ENDPOINT").map_err(|_| WarpScriptError::MissingEndpoint)?;
 
     // Use custom token if provided, otherwise fallback to WARP_TOKEN env var
     let token = if let Some(t) = custom_token {
         t.to_string()
     } else {
-        env::var("WARP_TOKEN")
-            .map_err(|_| WarpScriptError::MissingToken)?
+        env::var("WARP_TOKEN").map_err(|_| WarpScriptError::MissingToken)?
     };
-
-    // Read WarpScript file
-    let script = fs::read_to_string(warpscript_file)
-        .map_err(WarpScriptError::FileReadError)?;
-
-    debug!(
-        probe_name = %probe_name,
-        file = %warpscript_file,
-        "Read WarpScript file"
-    );
 
     // Substitute ${WARP_TOKEN} with actual token
     let script = script.replace("${WARP_TOKEN}", &token);
@@ -81,7 +67,7 @@ pub async fn execute_warpscript(
         "Token and app_id substitution completed"
     );
 
-    info!(
+    debug!(
         probe_name = %probe_name,
         endpoint = %endpoint,
         "Executing WarpScript"
@@ -98,14 +84,20 @@ pub async fn execute_warpscript(
     let status = response.status();
 
     if !status.is_success() {
-        let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        let error_body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
         error!(
             probe_name = %probe_name,
             status = %status,
             error = %error_body,
             "WarpScript execution failed"
         );
-        return Err(WarpScriptError::RequestError(format!("HTTP {}: {}", status, error_body)));
+        return Err(WarpScriptError::RequestError(format!(
+            "HTTP {}: {}",
+            status, error_body
+        )));
     }
 
     let body = response
@@ -135,11 +127,12 @@ pub async fn execute_warpscript(
 /// Parse Warp response to extract scalar value
 /// Warp returns a JSON array, we take the last element
 fn parse_warp_response(body: &str) -> Result<f64, WarpScriptError> {
-    let json: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| WarpScriptError::ParseError(e.to_string()))?;
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| WarpScriptError::ParseError(e.to_string()))?;
 
     // Response should be an array
-    let array = json.as_array()
+    let array = json
+        .as_array()
         .ok_or_else(|| WarpScriptError::ParseError("Response is not an array".to_string()))?;
 
     if array.is_empty() {
@@ -159,9 +152,10 @@ fn parse_warp_response(body: &str) -> Result<f64, WarpScriptError> {
         return Ok(num as f64);
     }
 
-    Err(WarpScriptError::ParseError(
-        format!("Last element is not a number: {:?}", last)
-    ))
+    Err(WarpScriptError::ParseError(format!(
+        "Last element is not a number: {:?}",
+        last
+    )))
 }
 
 #[cfg(test)]

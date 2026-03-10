@@ -45,11 +45,13 @@ pub struct HealthCheckApp {
 
 impl Probe {
     pub fn get_delay_after_success(&self) -> u64 {
-        self.delay_after_success_seconds.unwrap_or(self.interval_seconds)
+        self.delay_after_success_seconds
+            .unwrap_or(self.interval_seconds)
     }
 
     pub fn get_delay_after_failure(&self) -> u64 {
-        self.delay_after_failure_seconds.unwrap_or(self.interval_seconds)
+        self.delay_after_failure_seconds
+            .unwrap_or(self.interval_seconds)
     }
 
     pub fn get_delay_after_command_success(&self) -> u64 {
@@ -77,6 +79,10 @@ pub struct Checks {
     pub expected_body_contains: Option<String>,
     pub expected_body_regex: Option<String>,
     pub expected_header: Option<HashMap<String, String>>,
+    /// Pre-compiled version of `expected_body_regex`. Populated by `Config::validate`.
+    /// Skipped during (de)serialisation; `None` for probes built in tests.
+    #[serde(skip)]
+    pub compiled_body_regex: Option<regex::Regex>,
 }
 
 // WarpScript Probe Configuration
@@ -174,7 +180,8 @@ where
 
 impl WarpScriptProbe {
     pub fn get_delay_after_scale(&self) -> u64 {
-        self.delay_after_scale_seconds.unwrap_or(self.interval_seconds)
+        self.delay_after_scale_seconds
+            .unwrap_or(self.interval_seconds)
     }
 
     /// Get level configuration by level number
@@ -227,7 +234,10 @@ fn validate_app_id(probe_name: &str, id: &str) -> Result<(), Box<dyn std::error:
     if id.is_empty() {
         return Err(format!("Probe '{}': app id cannot be empty", probe_name).into());
     }
-    if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
         return Err(format!(
             "Probe '{}': app id '{}' contains invalid characters (only alphanumeric, '-', '_', '.' allowed)",
             probe_name, id
@@ -239,12 +249,12 @@ fn validate_app_id(probe_name: &str, id: &str) -> Result<(), Box<dyn std::error:
 impl Config {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let contents = fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&contents)?;
+        let mut config: Config = toml::from_str(&contents)?;
         config.validate()?;
         Ok(config)
     }
 
-    fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn validate(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.healthcheck_probes.is_empty() {
             return Err("Configuration must contain at least one probe".into());
         }
@@ -252,19 +262,29 @@ impl Config {
         // Validate uniqueness of effective probe names (post-app expansion)
         let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        for probe in &self.healthcheck_probes {
+        for probe in &mut self.healthcheck_probes {
             if probe.name.is_empty() {
                 return Err("Probe name cannot be empty".into());
             }
             // Either url or apps must be specified
             if probe.url.is_none() && probe.apps.is_empty() {
-                return Err(format!("Probe '{}' must have either 'url' or 'apps' configured", probe.name).into());
+                return Err(format!(
+                    "Probe '{}' must have either 'url' or 'apps' configured",
+                    probe.name
+                )
+                .into());
             }
             if probe.url.is_some() && !probe.apps.is_empty() {
-                return Err(format!("Probe '{}' cannot have both 'url' and 'apps' configured", probe.name).into());
+                return Err(format!(
+                    "Probe '{}' cannot have both 'url' and 'apps' configured",
+                    probe.name
+                )
+                .into());
             }
             if probe.interval_seconds == 0 {
-                return Err(format!("Probe '{}' has invalid interval (must be > 0)", probe.name).into());
+                return Err(
+                    format!("Probe '{}' has invalid interval (must be > 0)", probe.name).into(),
+                );
             }
 
             // Validate that at least one check is configured
@@ -276,20 +296,25 @@ impl Config {
                 return Err(format!("Probe '{}' has no checks configured", probe.name).into());
             }
 
-            // Validate regex patterns if present
+            // Validate and pre-compile regex patterns if present
             if let Some(ref pattern) = probe.checks.expected_body_regex {
-                regex::Regex::new(pattern)
+                let compiled = regex::Regex::new(pattern)
                     .map_err(|e| format!("Probe '{}' has invalid regex: {}", probe.name, e))?;
+                probe.checks.compiled_body_regex = Some(compiled);
             }
 
             // Validate effective names (after app expansion) are unique
             let effective_names: Vec<String> = if probe.apps.is_empty() {
                 vec![probe.name.clone()]
             } else {
-                probe.apps.iter().map(|a| {
-                    validate_app_id(&probe.name, &a.id)?;
-                    Ok(format!("{} - {}", probe.name, a.id))
-                }).collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
+                probe
+                    .apps
+                    .iter()
+                    .map(|a| {
+                        validate_app_id(&probe.name, &a.id)?;
+                        Ok(format!("{} - {}", probe.name, a.id))
+                    })
+                    .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
             };
             for name in effective_names {
                 if !seen_names.insert(name.clone()) {
@@ -320,14 +345,30 @@ impl Config {
                 }
             }
 
+            // Levels are sorted after deserialisation; check for gaps
+            let min = probe.min_level();
+            let max = probe.max_level();
+            let expected_count = (max - min + 1) as usize;
+            if probe.levels.len() != expected_count {
+                return Err(format!(
+                    "WarpScript probe '{}' levels must be contiguous (found gaps between {} and {})",
+                    probe.name, min, max
+                )
+                .into());
+            }
+
             // Validate effective names (after app expansion) are unique
             let effective_names: Vec<String> = if probe.apps.is_empty() {
                 vec![probe.name.clone()]
             } else {
-                probe.apps.iter().map(|a| {
-                    validate_app_id(&probe.name, &a.id)?;
-                    Ok(format!("{} - {}", probe.name, a.id))
-                }).collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
+                probe
+                    .apps
+                    .iter()
+                    .map(|a| {
+                        validate_app_id(&probe.name, &a.id)?;
+                        Ok(format!("{} - {}", probe.name, a.id))
+                    })
+                    .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?
             };
             for name in effective_names {
                 if !seen_names.insert(name.clone()) {
@@ -356,7 +397,7 @@ mod tests {
             expected_status = 200
         "#;
 
-        let config: Config = toml::from_str(toml_content).unwrap();
+        let mut config: Config = toml::from_str(toml_content).unwrap();
         assert!(config.validate().is_ok());
     }
 
@@ -366,7 +407,7 @@ mod tests {
             healthcheck_probes = []
         "#;
 
-        let config: Config = toml::from_str(toml_content).unwrap();
+        let mut config: Config = toml::from_str(toml_content).unwrap();
         assert!(config.validate().is_err());
     }
 
@@ -405,7 +446,7 @@ mod tests {
             downscale_command = "scale down"
             "#,
         );
-        let config: Config = toml::from_str(&toml).unwrap();
+        let mut config: Config = toml::from_str(&toml).unwrap();
         assert!(config.validate().is_ok());
         assert_eq!(config.warpscript_probes[0].levels.len(), 2);
         assert_eq!(config.warpscript_probes[0].levels[0].level, 1);
@@ -427,7 +468,7 @@ mod tests {
             downscale_command = "clever scale --app ${APP_ID} --flavor XS"
             "#,
         );
-        let config: Config = toml::from_str(&toml).unwrap();
+        let mut config: Config = toml::from_str(&toml).unwrap();
         assert!(config.validate().is_ok());
         let levels = &config.warpscript_probes[0].levels;
         assert_eq!(levels.len(), 3);
@@ -480,7 +521,7 @@ mod tests {
             "#,
         );
         // Deserialisation succeeds (duplicates not detected there), validate() catches it
-        let config: Config = toml::from_str(&toml).unwrap();
+        let mut config: Config = toml::from_str(&toml).unwrap();
         assert!(config.validate().is_err());
     }
 
@@ -495,7 +536,41 @@ mod tests {
             [healthcheck_probes.checks]
         "#;
 
-        let config: Config = toml::from_str(toml_content).unwrap();
+        let mut config: Config = toml::from_str(toml_content).unwrap();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_warpscript_non_contiguous_levels_rejected() {
+        let toml = warpscript_probe_toml(
+            r#"
+            [[warpscript_probes.levels]]
+            level = 1
+            scale_up_threshold = 70.0
+
+            [[warpscript_probes.levels]]
+            level = 3
+            scale_down_threshold = 50.0
+            "#,
+        );
+        let mut config: Config = toml::from_str(&toml).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_warpscript_contiguous_levels_accepted() {
+        let toml = warpscript_probe_toml(
+            r#"
+            [[warpscript_probes.levels]]
+            level = 2
+            scale_up_threshold = 70.0
+
+            [[warpscript_probes.levels]]
+            level = 3
+            scale_down_threshold = 50.0
+            "#,
+        );
+        let mut config: Config = toml::from_str(&toml).unwrap();
+        assert!(config.validate().is_ok());
     }
 }

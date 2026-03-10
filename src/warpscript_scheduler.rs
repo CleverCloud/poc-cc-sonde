@@ -2,11 +2,11 @@ use crate::config::WarpScriptProbe;
 use crate::executor;
 use crate::persistence::{self, PersistenceBackend, WarpScriptProbeState};
 use crate::warpscript_probe;
+use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
-use tracing::{debug, error, info};
-
+use tracing::{debug, error, info, warn};
 
 /// Execute a command with app_id substitution
 async fn execute_scaling_command(
@@ -55,7 +55,10 @@ async fn execute_scaling_command(
     }
 }
 
-pub async fn schedule_warpscript_probe(probe: WarpScriptProbe, backend: Arc<dyn PersistenceBackend>) {
+pub async fn schedule_warpscript_probe(
+    probe: WarpScriptProbe,
+    backend: Arc<dyn PersistenceBackend>,
+) {
     // Build the HTTP client once and reuse across all iterations
     let client = match warpscript_probe::build_client() {
         Ok(c) => c,
@@ -84,7 +87,11 @@ pub async fn schedule_warpscript_probe(probe: WarpScriptProbe, backend: Arc<dyn 
     }
 
     // Load previous state if exists
-    let previous_state = backend.load_warpscript_state(&probe.name).await.ok().flatten();
+    let previous_state = backend
+        .load_warpscript_state(&probe.name)
+        .await
+        .ok()
+        .flatten();
 
     let (mut current_level, mut next_delay) = match &previous_state {
         Some(state) => {
@@ -108,7 +115,20 @@ pub async fn schedule_warpscript_probe(probe: WarpScriptProbe, backend: Arc<dyn 
                 );
                 0
             };
-            (state.current_level, delay)
+            let loaded_level = state.current_level;
+            let current_level = if probe.get_level(loaded_level).is_some() {
+                loaded_level
+            } else {
+                let clamped = probe.min_level();
+                warn!(
+                    probe_name = %probe.name,
+                    loaded = loaded_level,
+                    clamped,
+                    "Loaded level not in config, resetting to min"
+                );
+                clamped
+            };
+            (current_level, delay)
         }
         None => {
             // Start at minimum level
@@ -119,6 +139,20 @@ pub async fn schedule_warpscript_probe(probe: WarpScriptProbe, backend: Arc<dyn 
                 "No previous state found, starting immediately"
             );
             (initial_level, 0)
+        }
+    };
+
+    // Read the WarpScript file once before the loop to avoid repeated disk I/O
+    let script_content = match fs::read_to_string(&probe.warpscript_file) {
+        Ok(content) => content,
+        Err(e) => {
+            error!(
+                probe_name = %probe.name,
+                file = %probe.warpscript_file,
+                error = %e,
+                "Failed to read WarpScript file"
+            );
+            return;
         }
     };
 
@@ -147,7 +181,15 @@ pub async fn schedule_warpscript_probe(probe: WarpScriptProbe, backend: Arc<dyn 
         let custom_token = app.and_then(|a| a.warp_token.as_deref());
 
         // Execute WarpScript and get value
-        let value = match warpscript_probe::execute_warpscript(&probe.name, &probe.warpscript_file, app_id, custom_token, &client).await {
+        let value = match warpscript_probe::execute_warpscript(
+            &probe.name,
+            &script_content,
+            app_id,
+            custom_token,
+            &client,
+        )
+        .await
+        {
             Ok(v) => {
                 info!(
                     probe_name = %probe.name,
@@ -188,8 +230,9 @@ pub async fn schedule_warpscript_probe(probe: WarpScriptProbe, backend: Arc<dyn 
                         cmd,
                         app_id,
                         probe.command_timeout_seconds,
-                        "upscale"
-                    ).await;
+                        "upscale",
+                    )
+                    .await;
                 } else {
                     debug!(
                         probe_name = %probe.name,
@@ -221,8 +264,9 @@ pub async fn schedule_warpscript_probe(probe: WarpScriptProbe, backend: Arc<dyn 
                         cmd,
                         app_id,
                         probe.command_timeout_seconds,
-                        "downscale"
-                    ).await;
+                        "downscale",
+                    )
+                    .await;
                 } else {
                     debug!(
                         probe_name = %probe.name,

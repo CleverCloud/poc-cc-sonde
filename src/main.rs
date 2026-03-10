@@ -9,7 +9,7 @@ mod warpscript_scheduler;
 
 use clap::Parser;
 use std::env;
-use tracing::info;
+use tracing::{debug, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -109,10 +109,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check WarpScript environment variables if WarpScript probes are configured
     if !config.warpscript_probes.is_empty() {
         // WARP_ENDPOINT is always required
-        let endpoint = env::var("WARP_ENDPOINT")
-            .map_err(|_| "WARP_ENDPOINT environment variable not set, but WarpScript probes are configured")?;
+        let endpoint = env::var("WARP_ENDPOINT").map_err(|_| {
+            "WARP_ENDPOINT environment variable not set, but WarpScript probes are configured"
+        })?;
 
-        info!(
+        debug!(
             warp_endpoint = %endpoint,
             "WarpScript environment configured"
         );
@@ -132,10 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn health check server if enabled
     if args.healthcheck {
-        info!(
-            port = args.healthcheck_port,
-            "Starting health check server"
-        );
+        info!(port = args.healthcheck_port, "Starting health check server");
         tokio::spawn(async move {
             if let Err(e) = healthcheck::start_healthcheck_server(args.healthcheck_port).await {
                 tracing::error!(error = %e, "Health check server failed");
@@ -184,7 +182,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
 
                 let backend_clone = backend.clone();
-                let handle = tokio::spawn(healthcheck_scheduler::schedule_probe(probe_instance, backend_clone));
+                let handle = tokio::spawn(healthcheck_scheduler::schedule_probe(
+                    probe_instance,
+                    backend_clone,
+                ));
                 handles.push(handle);
             }
         }
@@ -204,7 +205,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let backend_clone = backend.clone();
-            let handle = tokio::spawn(warpscript_scheduler::schedule_warpscript_probe(probe, backend_clone));
+            let handle = tokio::spawn(warpscript_scheduler::schedule_warpscript_probe(
+                probe,
+                backend_clone,
+            ));
             handles.push(handle);
         } else {
             // With apps: create one probe instance per app
@@ -233,7 +237,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
 
                 let backend_clone = backend.clone();
-                let handle = tokio::spawn(warpscript_scheduler::schedule_warpscript_probe(probe_instance, backend_clone));
+                let handle = tokio::spawn(warpscript_scheduler::schedule_warpscript_probe(
+                    probe_instance,
+                    backend_clone,
+                ));
                 handles.push(handle);
             }
         }

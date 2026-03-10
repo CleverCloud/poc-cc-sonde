@@ -2,6 +2,8 @@ use std::process::Output;
 use std::time::Duration;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
+#[cfg(unix)]
+extern crate libc;
 
 pub async fn execute_command(
     command: &str,
@@ -19,16 +21,22 @@ pub async fn execute_command(
     }
 
     // Spawn through shell to support &&, ||, ;, pipes, etc.
-    // kill_on_drop(true) ensures the child process is killed when the Child handle is dropped,
-    // which happens on timeout (the future is cancelled and the local is dropped).
-    let child = Command::new("sh")
-        .args(["-c", command])
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| {
-            error!(error = %e, "Failed to spawn command");
-            e
-        })?;
+    // kill_on_drop(true) ensures the shell is killed when the Child handle is dropped.
+    // process_group(0) places the child in its own process group so that SIGKILL on the
+    // group also reaches grandchildren (pipelines, sub-shells) on timeout.
+    let mut cmd = Command::new("sh");
+    cmd.args(["-c", command]).kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let child = cmd.spawn().map_err(|e| {
+        error!(error = %e, "Failed to spawn command");
+        e
+    })?;
+
+    // Capture PGID before moving `child` into wait_with_output.
+    // On Unix with process_group(0), PGID == child PID.
+    #[cfg(unix)]
+    let pgid = child.id();
 
     let output = match tokio::time::timeout(
         Duration::from_secs(timeout_seconds),
@@ -46,7 +54,14 @@ pub async fn execute_command(
                 timeout_seconds = timeout_seconds,
                 "Command execution timed out"
             );
-            // `child` is dropped here; kill_on_drop(true) sends SIGKILL to the process group
+            // kill_on_drop kills `sh`; also kill the entire process group to
+            // reach grandchildren (pipelines, sub-shells).
+            #[cfg(unix)]
+            if let Some(pid) = pgid {
+                // SAFETY: kill(2) is always safe to call; we ignore ESRCH if
+                // the group already exited.
+                unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+            }
             return Err("Command execution timed out".into());
         }
     };

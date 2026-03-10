@@ -12,18 +12,37 @@ pub fn build_client() -> Result<Client, reqwest::Error> {
 
 #[derive(Debug)]
 pub enum CheckFailure {
-    Status { expected: u16, actual: u16 },
-    BodyContains { expected: String, body: String },
-    BodyRegex { pattern: String, body: String },
-    Header { key: String, expected: String, actual: Option<String> },
-    RequestError { error: String },
+    Status {
+        expected: u16,
+        actual: u16,
+    },
+    BodyContains {
+        expected: String,
+        body: String,
+    },
+    BodyRegex {
+        pattern: String,
+        body: String,
+    },
+    Header {
+        key: String,
+        expected: String,
+        actual: Option<String>,
+    },
+    RequestError {
+        error: String,
+    },
 }
 
 impl std::fmt::Display for CheckFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CheckFailure::Status { expected, actual } => {
-                write!(f, "Status check failed: expected {}, got {}", expected, actual)
+                write!(
+                    f,
+                    "Status check failed: expected {}, got {}",
+                    expected, actual
+                )
             }
             CheckFailure::BodyContains { expected, body } => {
                 write!(
@@ -41,7 +60,11 @@ impl std::fmt::Display for CheckFailure {
                     body.len()
                 )
             }
-            CheckFailure::Header { key, expected, actual } => {
+            CheckFailure::Header {
+                key,
+                expected,
+                actual,
+            } => {
                 write!(
                     f,
                     "Header check failed: expected '{}' = '{}', got {:?}",
@@ -155,11 +178,19 @@ pub async fn execute_probe(probe: &Probe, client: &Client) -> Result<bool, Check
         );
     }
 
-    // Check body regex
+    // Check body regex — use pre-compiled version when available (normal path),
+    // fall back to on-the-fly compilation for probes built manually in tests.
     if let Some(ref pattern) = probe.checks.expected_body_regex {
-        let re = Regex::new(pattern).map_err(|e| CheckFailure::RequestError {
-            error: format!("Invalid regex: {}", e),
-        })?;
+        let fallback;
+        let re: &Regex = match probe.checks.compiled_body_regex.as_ref() {
+            Some(r) => r,
+            None => {
+                fallback = Regex::new(pattern).map_err(|e| CheckFailure::RequestError {
+                    error: format!("Invalid regex: {}", e),
+                })?;
+                &fallback
+            }
+        };
 
         if !re.is_match(&body) {
             warn!(
@@ -248,6 +279,7 @@ mod tests {
                 expected_body_contains: Some("ok".to_string()),
                 expected_body_regex: None,
                 expected_header: None,
+                compiled_body_regex: None,
             },
             on_failure_command: None,
             command_timeout_seconds: 30,

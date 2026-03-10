@@ -30,10 +30,19 @@ pub struct WarpScriptProbeState {
 #[async_trait::async_trait]
 pub trait PersistenceBackend: Send + Sync {
     async fn save_state(&self, state: &ProbeState) -> Result<(), Box<dyn std::error::Error>>;
-    async fn load_state(&self, probe_name: &str) -> Result<Option<ProbeState>, Box<dyn std::error::Error>>;
+    async fn load_state(
+        &self,
+        probe_name: &str,
+    ) -> Result<Option<ProbeState>, Box<dyn std::error::Error>>;
 
-    async fn save_warpscript_state(&self, state: &WarpScriptProbeState) -> Result<(), Box<dyn std::error::Error>>;
-    async fn load_warpscript_state(&self, probe_name: &str) -> Result<Option<WarpScriptProbeState>, Box<dyn std::error::Error>>;
+    async fn save_warpscript_state(
+        &self,
+        state: &WarpScriptProbeState,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+    async fn load_warpscript_state(
+        &self,
+        probe_name: &str,
+    ) -> Result<Option<WarpScriptProbeState>, Box<dyn std::error::Error>>;
 }
 
 // In-memory implementation (default)
@@ -65,12 +74,18 @@ impl PersistenceBackend for InMemoryBackend {
         Ok(())
     }
 
-    async fn load_state(&self, probe_name: &str) -> Result<Option<ProbeState>, Box<dyn std::error::Error>> {
+    async fn load_state(
+        &self,
+        probe_name: &str,
+    ) -> Result<Option<ProbeState>, Box<dyn std::error::Error>> {
         let states = self.states.lock().await;
         Ok(states.get(probe_name).cloned())
     }
 
-    async fn save_warpscript_state(&self, state: &WarpScriptProbeState) -> Result<(), Box<dyn std::error::Error>> {
+    async fn save_warpscript_state(
+        &self,
+        state: &WarpScriptProbeState,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut states = self.warpscript_states.lock().await;
         states.insert(state.probe_name.clone(), state.clone());
         debug!(
@@ -82,7 +97,10 @@ impl PersistenceBackend for InMemoryBackend {
         Ok(())
     }
 
-    async fn load_warpscript_state(&self, probe_name: &str) -> Result<Option<WarpScriptProbeState>, Box<dyn std::error::Error>> {
+    async fn load_warpscript_state(
+        &self,
+        probe_name: &str,
+    ) -> Result<Option<WarpScriptProbeState>, Box<dyn std::error::Error>> {
         let states = self.warpscript_states.lock().await;
         Ok(states.get(probe_name).cloned())
     }
@@ -97,7 +115,7 @@ pub struct RedisBackend {
 #[cfg(feature = "redis-persistence")]
 impl RedisBackend {
     pub async fn new(redis_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        info!(redis_url = %redis_url, "Connecting to Redis");
+        info!("Connecting to Redis");
         let client = redis::Client::open(redis_url)?;
 
         // Test connection
@@ -136,14 +154,14 @@ impl PersistenceBackend for RedisBackend {
         Ok(())
     }
 
-    async fn load_state(&self, probe_name: &str) -> Result<Option<ProbeState>, Box<dyn std::error::Error>> {
+    async fn load_state(
+        &self,
+        probe_name: &str,
+    ) -> Result<Option<ProbeState>, Box<dyn std::error::Error>> {
         let mut con = self.client.get_multiplexed_async_connection().await?;
         let key = Self::get_key(probe_name);
 
-        let value: Option<String> = redis::cmd("GET")
-            .arg(&key)
-            .query_async(&mut con)
-            .await?;
+        let value: Option<String> = redis::cmd("GET").arg(&key).query_async(&mut con).await?;
 
         match value {
             Some(json) => {
@@ -162,7 +180,10 @@ impl PersistenceBackend for RedisBackend {
         }
     }
 
-    async fn save_warpscript_state(&self, state: &WarpScriptProbeState) -> Result<(), Box<dyn std::error::Error>> {
+    async fn save_warpscript_state(
+        &self,
+        state: &WarpScriptProbeState,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut con = self.client.get_multiplexed_async_connection().await?;
         let key = format!("poc-sonde:warpscript:{}", state.probe_name);
         let value = serde_json::to_string(state)?;
@@ -182,14 +203,14 @@ impl PersistenceBackend for RedisBackend {
         Ok(())
     }
 
-    async fn load_warpscript_state(&self, probe_name: &str) -> Result<Option<WarpScriptProbeState>, Box<dyn std::error::Error>> {
+    async fn load_warpscript_state(
+        &self,
+        probe_name: &str,
+    ) -> Result<Option<WarpScriptProbeState>, Box<dyn std::error::Error>> {
         let mut con = self.client.get_multiplexed_async_connection().await?;
         let key = format!("poc-sonde:warpscript:{}", probe_name);
 
-        let value: Option<String> = redis::cmd("GET")
-            .arg(&key)
-            .query_async(&mut con)
-            .await?;
+        let value: Option<String> = redis::cmd("GET").arg(&key).query_async(&mut con).await?;
 
         match value {
             Some(json) => {

@@ -14,7 +14,8 @@ async fn handle_request(_req: Request<Body>) -> Result<Response<Body>, Infallibl
 pub async fn start_healthcheck_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
-    let make_svc = make_service_fn(|_conn| async { Ok::<_, Infallible>(service_fn(handle_request)) });
+    let make_svc =
+        make_service_fn(|_conn| async { Ok::<_, Infallible>(service_fn(handle_request)) });
 
     let server = Server::bind(&addr).serve(make_svc);
 

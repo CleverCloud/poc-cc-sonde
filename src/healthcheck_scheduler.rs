@@ -82,7 +82,11 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) 
         );
 
         let check_timestamp = persistence::current_timestamp();
-        let (success, command_executed, command_succeeded) = match healthcheck_probe::execute_probe(&probe, &client).await {
+        let (success, command_executed, command_succeeded) = match healthcheck_probe::execute_probe(
+            &probe, &client,
+        )
+        .await
+        {
             Ok(_) => {
                 info!(
                     probe_name = %probe.name,
@@ -110,7 +114,7 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) 
                 if let Some(ref command) = probe.on_failure_command {
                     let retry_threshold = probe.get_failure_retries_before_command();
 
-                    if consecutive_failures > retry_threshold {
+                    if consecutive_failures >= retry_threshold {
                         command_executed = true;
 
                         // Substitute ${APP_ID} if an app is configured
@@ -129,7 +133,9 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) 
                             "Failure threshold reached, executing command"
                         );
 
-                        match executor::execute_command(&command, probe.command_timeout_seconds).await {
+                        match executor::execute_command(&command, probe.command_timeout_seconds)
+                            .await
+                        {
                             Ok(output) => {
                                 if output.status.success() {
                                     command_succeeded = true;

@@ -166,6 +166,7 @@ dependencies = [
  "clap",
  "hyper 0.14.32",
  "hyper-util",
+ "libc",
  "mockito",
  "redis",
  "regex",
