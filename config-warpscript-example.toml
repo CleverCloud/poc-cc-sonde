@@ -120,6 +120,49 @@ level = 4
 scale_down_threshold = 400.0  # < 400 req/s
 downscale_command = "kubectl scale deployment api --replicas=4"
 
+# Example 4: Shared thresholds across multiple levels using `levels = [N, M, ...]`
+# When several levels share identical thresholds and commands, use the plural
+# `levels` key to avoid repeating the same block.
+#
+# Before (verbose):
+#   [[warpscript_probes.levels]]
+#   level = 2
+#   scale_down_threshold = 45.0
+#   downscale_command = "clever scale --app ${APP_ID} --flavor XS"
+#
+#   [[warpscript_probes.levels]]
+#   level = 3
+#   scale_down_threshold = 45.0
+#   downscale_command = "clever scale --app ${APP_ID} --flavor XS"
+#
+# After (compact):
+#   [[warpscript_probes.levels]]
+#   levels = [2, 3]
+#   scale_down_threshold = 45.0
+#   downscale_command = "clever scale --app ${APP_ID} --flavor XS"
+[[warpscript_probes]]
+name = "Compact Scaler"
+warpscript_file = "warpscript/cpu_usage.mc2"
+interval_seconds = 60
+delay_after_scale_seconds = 120
+
+[[warpscript_probes.levels]]
+level = 1
+scale_up_threshold = 60.0
+upscale_command = "clever scale --app ${APP_ID} --flavor S"
+
+# Levels 2 and 3 share the same downscale threshold and command
+# (both scale all the way back to XS when under load)
+[[warpscript_probes.levels]]
+levels = [2, 3]
+scale_down_threshold = 45.0
+downscale_command = "clever scale --app ${APP_ID} --flavor XS"
+
+[[warpscript_probes.levels]]
+level = 4
+scale_down_threshold = 65.0
+downscale_command = "clever scale --app ${APP_ID} --flavor M"
+
 # How it works:
 # 1. WarpScript executes periodically and returns a numeric value
 # 2. The value is compared against thresholds of the CURRENT level

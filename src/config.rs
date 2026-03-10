@@ -93,6 +93,7 @@ pub struct WarpScriptProbe {
     #[serde(default)]
     pub apps: Vec<WarpScriptApp>,
     /// Scaling levels (must be ordered by level number)
+    #[serde(deserialize_with = "deserialize_levels")]
     pub levels: Vec<ScalingLevel>,
 }
 
@@ -116,6 +117,59 @@ pub struct ScalingLevel {
     pub upscale_command: Option<String>,
     /// Command to execute when scaling down FROM this level
     pub downscale_command: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScalingLevelRaw {
+    /// Singular form: level = N (backwards-compatible)
+    level: Option<u32>,
+    /// Plural form: levels = [N, M, ...] (new)
+    #[serde(default)]
+    levels: Vec<u32>,
+    scale_up_threshold: Option<f64>,
+    scale_down_threshold: Option<f64>,
+    upscale_command: Option<String>,
+    downscale_command: Option<String>,
+}
+
+fn deserialize_levels<'de, D>(deserializer: D) -> Result<Vec<ScalingLevel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let raw_entries: Vec<ScalingLevelRaw> = Vec::deserialize(deserializer)?;
+    let mut result: Vec<ScalingLevel> = Vec::new();
+
+    for raw in raw_entries {
+        let level_nums: Vec<u32> = match (raw.level, raw.levels.is_empty()) {
+            (Some(n), true) => vec![n],
+            (None, false) => raw.levels,
+            (Some(_), false) => {
+                return Err(D::Error::custom(
+                    "a scaling level entry cannot specify both `level` and `levels`",
+                ));
+            }
+            (None, true) => {
+                return Err(D::Error::custom(
+                    "a scaling level entry must specify either `level = N` or `levels = [N, ...]`",
+                ));
+            }
+        };
+
+        for n in level_nums {
+            result.push(ScalingLevel {
+                level: n,
+                scale_up_threshold: raw.scale_up_threshold,
+                scale_down_threshold: raw.scale_down_threshold,
+                upscale_command: raw.upscale_command.clone(),
+                downscale_command: raw.downscale_command.clone(),
+            });
+        }
+    }
+
+    result.sort_by_key(|l| l.level);
+    Ok(result)
 }
 
 impl WarpScriptProbe {
@@ -211,6 +265,29 @@ impl Config {
             }
         }
 
+        for probe in &self.warpscript_probes {
+            if probe.name.is_empty() {
+                return Err("WarpScript probe name cannot be empty".into());
+            }
+            if probe.levels.is_empty() {
+                return Err(format!(
+                    "WarpScript probe '{}' must define at least one level",
+                    probe.name
+                )
+                .into());
+            }
+            let mut seen = std::collections::HashSet::new();
+            for level in &probe.levels {
+                if !seen.insert(level.level) {
+                    return Err(format!(
+                        "WarpScript probe '{}' has duplicate level number {}",
+                        probe.name, level.level
+                    )
+                    .into());
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -242,6 +319,120 @@ mod tests {
         "#;
 
         let config: Config = toml::from_str(toml_content).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    fn warpscript_probe_toml(levels_block: &str) -> String {
+        format!(
+            r#"
+            [[healthcheck_probes]]
+            name = "hp"
+            url = "https://example.com"
+            interval_seconds = 60
+            [healthcheck_probes.checks]
+            expected_status = 200
+
+            [[warpscript_probes]]
+            name = "ws"
+            warpscript_file = "test.mc2"
+            interval_seconds = 60
+            {}
+            "#,
+            levels_block
+        )
+    }
+
+    #[test]
+    fn test_warpscript_level_singular() {
+        let toml = warpscript_probe_toml(
+            r#"
+            [[warpscript_probes.levels]]
+            level = 1
+            scale_up_threshold = 70.0
+            upscale_command = "scale up"
+
+            [[warpscript_probes.levels]]
+            level = 2
+            scale_down_threshold = 50.0
+            downscale_command = "scale down"
+            "#,
+        );
+        let config: Config = toml::from_str(&toml).unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(config.warpscript_probes[0].levels.len(), 2);
+        assert_eq!(config.warpscript_probes[0].levels[0].level, 1);
+        assert_eq!(config.warpscript_probes[0].levels[1].level, 2);
+    }
+
+    #[test]
+    fn test_warpscript_levels_plural_expands() {
+        let toml = warpscript_probe_toml(
+            r#"
+            [[warpscript_probes.levels]]
+            level = 1
+            scale_up_threshold = 70.0
+            upscale_command = "scale up"
+
+            [[warpscript_probes.levels]]
+            levels = [2, 3]
+            scale_down_threshold = 45.0
+            downscale_command = "clever scale --app ${APP_ID} --flavor XS"
+            "#,
+        );
+        let config: Config = toml::from_str(&toml).unwrap();
+        assert!(config.validate().is_ok());
+        let levels = &config.warpscript_probes[0].levels;
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[1].level, 2);
+        assert_eq!(levels[2].level, 3);
+        assert_eq!(levels[1].scale_down_threshold, Some(45.0));
+        assert_eq!(levels[2].scale_down_threshold, Some(45.0));
+        assert_eq!(
+            levels[1].downscale_command.as_deref(),
+            Some("clever scale --app ${APP_ID} --flavor XS")
+        );
+        assert_eq!(
+            levels[2].downscale_command.as_deref(),
+            Some("clever scale --app ${APP_ID} --flavor XS")
+        );
+    }
+
+    #[test]
+    fn test_warpscript_level_and_levels_both_rejected() {
+        let toml = warpscript_probe_toml(
+            r#"
+            [[warpscript_probes.levels]]
+            level = 1
+            levels = [1, 2]
+            "#,
+        );
+        assert!(toml::from_str::<Config>(&toml).is_err());
+    }
+
+    #[test]
+    fn test_warpscript_neither_level_nor_levels_rejected() {
+        let toml = warpscript_probe_toml(
+            r#"
+            [[warpscript_probes.levels]]
+            scale_up_threshold = 70.0
+            "#,
+        );
+        assert!(toml::from_str::<Config>(&toml).is_err());
+    }
+
+    #[test]
+    fn test_warpscript_duplicate_level_rejected_by_validate() {
+        let toml = warpscript_probe_toml(
+            r#"
+            [[warpscript_probes.levels]]
+            level = 1
+
+            [[warpscript_probes.levels]]
+            levels = [1, 2]
+            "#,
+        );
+        // Deserialisation succeeds (duplicates not detected there), validate() catches it
+        let config: Config = toml::from_str(&toml).unwrap();
         assert!(config.validate().is_err());
     }
 

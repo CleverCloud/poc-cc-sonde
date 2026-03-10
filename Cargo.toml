@@ -1,5 +1,5 @@
 [package]
-name = "poc-sonde"
+name = "cc-sonde"
 version = "0.1.0"
 edition = "2021"
 
