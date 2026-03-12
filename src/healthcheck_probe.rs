@@ -2,7 +2,7 @@ use crate::config::Probe;
 use regex::Regex;
 use reqwest::Client;
 use std::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub fn build_client() -> Result<Client, reqwest::Error> {
     Client::builder().build()
@@ -79,20 +79,20 @@ impl std::fmt::Display for CheckFailure {
 pub async fn execute_probe(probe: &Probe, client: &Client) -> Result<bool, CheckFailure> {
     let url = probe.url.as_deref().unwrap_or("");
     let start = Instant::now();
-    info!(
+    debug!(
         probe_name = %probe.name,
-        url = %url,
+        url = %crate::utils::sanitize_url_for_log(url),
         "Starting HTTP probe"
     );
 
     // Execute HTTP request
     let timeout = std::time::Duration::from_secs(probe.get_request_timeout());
-    let response = match client.get(url).timeout(timeout).send().await {
+    let mut response = match client.get(url).timeout(timeout).send().await {
         Ok(resp) => resp,
         Err(e) => {
             error!(
                 probe_name = %probe.name,
-                url = %url,
+                url = %crate::utils::sanitize_url_for_log(url),
                 error = %e,
                 "HTTP request failed"
             );
@@ -107,9 +107,9 @@ pub async fn execute_probe(probe: &Probe, client: &Client) -> Result<bool, Check
     // Save headers before consuming the response body — avoids a second HTTP request
     let headers = response.headers().clone();
 
-    info!(
+    debug!(
         probe_name = %probe.name,
-        url = %url,
+        url = %crate::utils::sanitize_url_for_log(url),
         status = status,
         duration_ms = duration.as_millis(),
         "Received HTTP response"
@@ -136,23 +136,39 @@ pub async fn execute_probe(probe: &Probe, client: &Client) -> Result<bool, Check
         );
     }
 
-    // Get response body for body checks
+    // Get response body for body checks (capped at 1 MiB to prevent memory exhaustion).
+    // Chunks are read one at a time so a large response never fully buffers in memory.
+    const MAX_BODY_BYTES: usize = 1024 * 1024;
     let body = if probe.checks.expected_body_contains.is_some()
         || probe.checks.expected_body_regex.is_some()
     {
-        match response.text().await {
-            Ok(text) => text,
-            Err(e) => {
-                error!(
-                    probe_name = %probe.name,
-                    error = %e,
-                    "Failed to read response body"
-                );
-                return Err(CheckFailure::RequestError {
-                    error: format!("Failed to read body: {}", e),
-                });
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    let remaining = MAX_BODY_BYTES.saturating_sub(buf.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                    if buf.len() >= MAX_BODY_BYTES {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    error!(
+                        probe_name = %probe.name,
+                        error = %e,
+                        "Failed to read response body"
+                    );
+                    return Err(CheckFailure::RequestError {
+                        error: format!("Failed to read body: {}", e),
+                    });
+                }
             }
         }
+        String::from_utf8_lossy(&buf).into_owned()
     } else {
         String::new()
     };
@@ -295,5 +311,47 @@ mod tests {
         let result = execute_probe(&probe, &client).await;
         assert!(result.is_ok());
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_body_capped_at_max_bytes() {
+        const MAX: usize = 1 * 1024 * 1024;
+        let mut body = vec![b'a'; MAX];
+        body.extend_from_slice(&vec![b'z'; 512]);
+
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let probe = Probe {
+            name: "cap-test".to_string(),
+            url: Some(server.url()),
+            interval_seconds: 1,
+            checks: Checks {
+                expected_status: Some(200),
+                expected_body_contains: Some("zzz".to_string()),
+                expected_body_regex: None,
+                expected_header: None,
+                compiled_body_regex: None,
+            },
+            on_failure_command: None,
+            command_timeout_seconds: 30,
+            delay_after_success_seconds: None,
+            delay_after_failure_seconds: None,
+            delay_after_command_success_seconds: None,
+            delay_after_command_failure_seconds: None,
+            failure_retries_before_command: None,
+            request_timeout_seconds: None,
+            apps: vec![],
+        };
+
+        let client = build_client().unwrap();
+        let result = execute_probe(&probe, &client).await;
+        // Body was truncated at MAX_BODY_BYTES → "zzz" is not found
+        assert!(matches!(result, Err(CheckFailure::BodyContains { .. })));
     }
 }

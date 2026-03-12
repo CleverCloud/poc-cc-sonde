@@ -4,10 +4,12 @@ mod healthcheck;
 mod healthcheck_probe;
 mod healthcheck_scheduler;
 mod persistence;
+mod utils;
 mod warpscript_probe;
 mod warpscript_scheduler;
 
 use clap::Parser;
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use std::env;
 use tracing::{debug, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -30,6 +32,11 @@ struct Args {
     /// Dry run mode: probe checks are executed but remediation commands are not
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+
+    /// Multi-instance mode: Redis is required for distributed locking.
+    /// Can also be set via the MULTI_INSTANCE environment variable.
+    #[arg(long, default_value_t = false, env = "MULTI_INSTANCE")]
+    multi_instance: bool,
 }
 
 /// Get Redis URL from environment variables
@@ -46,7 +53,8 @@ fn get_redis_url() -> Option<String> {
         let password = env::var("REDIS_PASSWORD").ok();
 
         let url = if let Some(pwd) = password {
-            format!("redis://:{}@{}:{}", pwd, host, port)
+            let encoded_pwd = utf8_percent_encode(&pwd, NON_ALPHANUMERIC).to_string();
+            format!("redis://:{}@{}:{}", encoded_pwd, host, port)
         } else {
             format!("redis://{}:{}", host, port)
         };
@@ -57,32 +65,6 @@ fn get_redis_url() -> Option<String> {
     None
 }
 
-/// Mask password in Redis URL for safe logging.
-/// Handles both redis://:password@host and redis://user:password@host formats.
-fn mask_redis_password(url: &str) -> String {
-    // Find the authority section: after "://" and before the next "/"
-    if let Some(scheme_end) = url.find("://") {
-        let rest = &url[scheme_end + 3..];
-        let authority_end = rest.find('/').unwrap_or(rest.len());
-        let authority = &rest[..authority_end];
-
-        // Password is present only when there is an '@' in the authority
-        if let Some(at_pos) = authority.rfind('@') {
-            let user_info = &authority[..at_pos];
-            // Password starts after the first ':' in user_info (covers both ":pass" and "user:pass")
-            if let Some(colon_pos) = user_info.find(':') {
-                let password_start = scheme_end + 3 + colon_pos + 1;
-                let password_end = scheme_end + 3 + at_pos;
-                if password_start < password_end {
-                    let mut masked = url.to_string();
-                    masked.replace_range(password_start..password_end, "****");
-                    return masked;
-                }
-            }
-        }
-    }
-    url.to_string()
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -90,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "poc_sonde=info".into()),
+                .unwrap_or_else(|_| "cc_sonde=info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -102,6 +84,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.dry_run {
         warn!("Dry run mode enabled: remediation commands will not be executed");
+    }
+
+    if args.multi_instance {
+        warn!("Multi-instance mode enabled: Redis is required for distributed locking");
     }
 
     // Load and validate configuration
@@ -122,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })?;
 
         debug!(
-            warp_endpoint = %endpoint,
+            warp_endpoint = %utils::sanitize_url_for_log(&endpoint),
             "WarpScript environment configured"
         );
     }
@@ -130,14 +116,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize persistence backend
     let redis_url = get_redis_url();
     if let Some(ref url) = redis_url {
-        // Mask password in logs
-        let masked_url = mask_redis_password(url);
+        let masked_url = utils::sanitize_url_for_log(url);
         info!(redis_url = %masked_url, "Redis configuration detected");
     } else {
         info!("No Redis configuration found, using in-memory persistence");
     }
 
-    let backend = persistence::create_backend(redis_url).await;
+    let backend = persistence::create_backend(redis_url.clone(), args.multi_instance)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Fatal: Redis connection failed in multi-instance mode: {}", e);
+            std::process::exit(1);
+        });
+
+    if redis_url.is_some() && !args.multi_instance {
+        warn!(
+            "Redis is configured but --multi-instance is not set. \
+             If running multiple replicas, add --multi-instance (or MULTI_INSTANCE=true) \
+             to enable distributed locking."
+        );
+    }
 
     // Spawn health check server if enabled
     if args.healthcheck {
@@ -158,13 +156,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // No apps: single probe with direct url
             info!(
                 probe_name = %probe.name,
-                url = %probe.url.as_deref().unwrap_or(""),
+                url = %utils::sanitize_url_for_log(probe.url.as_deref().unwrap_or("")),
                 interval_seconds = probe.interval_seconds,
                 "Spawning healthcheck probe task"
             );
 
             let backend_clone = backend.clone();
-            let handle = tokio::spawn(healthcheck_scheduler::schedule_probe(probe, backend_clone, args.dry_run));
+            let handle = tokio::spawn(healthcheck_scheduler::schedule_probe(probe, backend_clone, args.dry_run, args.multi_instance));
             handles.push(handle);
         } else {
             // With apps: create one probe instance per app
@@ -184,7 +182,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 info!(
                     probe_name = %probe_instance.name,
                     app_id = %app.id,
-                    url = %app.url,
+                    url = %utils::sanitize_url_for_log(&app.url),
                     interval_seconds = probe_instance.interval_seconds,
                     "Spawning healthcheck probe instance"
                 );
@@ -194,6 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     probe_instance,
                     backend_clone,
                     args.dry_run,
+                    args.multi_instance,
                 ));
                 handles.push(handle);
             }
@@ -218,6 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 probe,
                 backend_clone,
                 args.dry_run,
+                args.multi_instance,
             ));
             handles.push(handle);
         } else {
@@ -251,6 +251,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     probe_instance,
                     backend_clone,
                     args.dry_run,
+                    args.multi_instance,
                 ));
                 handles.push(handle);
             }

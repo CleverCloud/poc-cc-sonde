@@ -7,7 +7,12 @@ use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
-pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>, dry_run: bool) {
+pub async fn schedule_probe(
+    probe: Probe,
+    backend: Arc<dyn PersistenceBackend>,
+    dry_run: bool,
+    multi_instance: bool,
+) {
     // Build the HTTP client once and reuse across all iterations
     let client = match healthcheck_probe::build_client() {
         Ok(c) => c,
@@ -77,19 +82,32 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>, 
         }
 
         let lock_key = format!("poc-sonde:lock:probe:{}", probe.name);
-        let ttl_ms = (probe.interval_seconds + probe.command_timeout_seconds + 10) * 1000;
+        let ttl_ms = (probe.interval_seconds
+            + probe.get_request_timeout()
+            + probe.command_timeout_seconds
+            + 10) * 1000;
 
-        match backend.acquire_lock(&lock_key, ttl_ms).await {
-            Ok(false) => {
+        let lock_token = match backend.acquire_lock(&lock_key, ttl_ms).await {
+            Ok(None) => {
                 debug!(probe_name = %probe.name, "Lock held by another instance, skipping cycle");
                 next_delay = probe.get_delay_after_success();
                 continue;
             }
             Err(e) => {
-                warn!(probe_name = %probe.name, error = %e, "Lock acquisition failed, proceeding anyway");
+                if multi_instance {
+                    // Fail-closed: skipping this cycle preserves mutual exclusion guarantee
+                    error!(probe_name = %probe.name, error = %e,
+                           "Lock acquisition failed in multi-instance mode, skipping cycle");
+                    next_delay = probe.get_delay_after_success();
+                    continue;
+                }
+                // Single-instance: fail-open (backward-compatible)
+                warn!(probe_name = %probe.name, error = %e,
+                      "Lock acquisition failed, proceeding without lock");
+                None
             }
-            Ok(true) => {}
-        }
+            Ok(Some(token)) => Some(token),
+        };
 
         info!(
             probe_name = %probe.name,
@@ -129,7 +147,7 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>, 
                 if let Some(ref command) = probe.on_failure_command {
                     let retry_threshold = probe.get_failure_retries_before_command();
 
-                    if consecutive_failures >= retry_threshold {
+                    if consecutive_failures > retry_threshold {
                         command_executed = true;
 
                         // Substitute ${APP_ID} if an app is configured
@@ -227,8 +245,10 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>, 
             );
         }
 
-        if let Err(e) = backend.release_lock(&lock_key).await {
-            debug!(probe_name = %probe.name, error = %e, "Failed to release lock (will expire via TTL)");
+        if let Some(ref token) = lock_token {
+            if let Err(e) = backend.release_lock(&lock_key, token).await {
+                debug!(probe_name = %probe.name, error = %e, "Failed to release lock (will expire via TTL)");
+            }
         }
 
         debug!(
@@ -237,5 +257,80 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>, 
             success = success,
             "Scheduled next execution"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Checks;
+    use crate::persistence::FailingLockBackend;
+    use std::sync::Arc;
+
+    fn test_probe(url: String) -> Probe {
+        Probe {
+            name: "lock-test".to_string(),
+            url: Some(url),
+            interval_seconds: 1,
+            checks: Checks {
+                expected_status: Some(200),
+                expected_body_contains: None,
+                expected_body_regex: None,
+                expected_header: None,
+                compiled_body_regex: None,
+            },
+            on_failure_command: None,
+            command_timeout_seconds: 5,
+            delay_after_success_seconds: None,
+            delay_after_failure_seconds: None,
+            delay_after_command_success_seconds: None,
+            delay_after_command_failure_seconds: None,
+            failure_retries_before_command: None,
+            request_timeout_seconds: Some(1),
+            apps: vec![],
+        }
+    }
+
+    // multi_instance=true + lock error → probe skipped, 0 HTTP requests
+    #[tokio::test]
+    async fn test_lock_error_skips_cycle_when_multi_instance() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server.mock("GET", "/").with_status(200).create_async().await;
+
+        let backend: Arc<dyn PersistenceBackend> = Arc::new(FailingLockBackend::new());
+        let handle = tokio::spawn(schedule_probe(
+            test_probe(server.url()),
+            backend,
+            false,
+            true, // multi_instance=true
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        handle.abort();
+
+        mock.expect(0).assert_async().await;
+    }
+
+    // multi_instance=false + lock error → probe executed (fail-open), ≥1 HTTP requests
+    #[tokio::test]
+    async fn test_lock_error_proceeds_when_single_instance() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/")
+            .with_status(200)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let backend: Arc<dyn PersistenceBackend> = Arc::new(FailingLockBackend::new());
+        let handle = tokio::spawn(schedule_probe(
+            test_probe(server.url()),
+            backend,
+            false,
+            false, // multi_instance=false
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        handle.abort();
+
+        mock.assert_async().await;
     }
 }

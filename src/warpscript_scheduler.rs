@@ -9,14 +9,15 @@ use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
-/// Execute a command with app_id substitution
-async fn execute_scaling_command(
+/// Execute a command with app_id substitution.
+/// Returns `true` if the command succeeded, `false` otherwise.
+pub(crate) async fn execute_scaling_command(
     probe_name: &str,
     command: &str,
     app_id: Option<&str>,
     timeout_seconds: u64,
     action: &str, // "upscale" or "downscale"
-) {
+) -> bool {
     // Substitute ${APP_ID} if present
     let cmd = if let Some(id) = app_id {
         command.replace("${APP_ID}", id)
@@ -28,19 +29,20 @@ async fn execute_scaling_command(
     debug!(command = %cmd, "Scaling command detail");
 
     match executor::execute_command(&cmd, timeout_seconds).await {
+        Ok(output) if output.status.success() => {
+            warn!(
+                probe_name = %probe_name,
+                "{} command completed successfully", action
+            );
+            true
+        }
         Ok(output) => {
-            if output.status.success() {
-                warn!(
-                    probe_name = %probe_name,
-                    "{} command completed successfully", action
-                );
-            } else {
-                error!(
-                    probe_name = %probe_name,
-                    exit_code = output.status.code().unwrap_or(-1),
-                    "{} command completed with errors", action
-                );
-            }
+            error!(
+                probe_name = %probe_name,
+                exit_code = output.status.code().unwrap_or(-1),
+                "{} command completed with errors", action
+            );
+            false
         }
         Err(e) => {
             error!(
@@ -48,6 +50,7 @@ async fn execute_scaling_command(
                 error = %e,
                 "Failed to execute {} command", action
             );
+            false
         }
     }
 }
@@ -56,6 +59,7 @@ pub async fn schedule_warpscript_probe(
     probe: WarpScriptProbe,
     backend: Arc<dyn PersistenceBackend>,
     dry_run: bool,
+    multi_instance: bool,
 ) {
     // Build the HTTP client once and reuse across all iterations
     let client = match warpscript_probe::build_client() {
@@ -180,19 +184,32 @@ pub async fn schedule_warpscript_probe(
         }
 
         let lock_key = format!("poc-sonde:lock:warpscript:{}", probe.name);
-        let ttl_ms = (probe.interval_seconds + probe.command_timeout_seconds + 10) * 1000;
+        // TTL = HTTP timeout + remote execution timeout + safety margin.
+        // Using the probe's actual HTTP timeout avoids the lock expiring mid-request
+        // when interval_seconds is shorter than request_timeout_seconds.
+        let ttl_ms = (probe.get_request_timeout() + probe.command_timeout_seconds + 10) * 1000;
 
-        match backend.acquire_lock(&lock_key, ttl_ms).await {
-            Ok(false) => {
+        let lock_token = match backend.acquire_lock(&lock_key, ttl_ms).await {
+            Ok(None) => {
                 debug!(probe_name = %probe.name, "Lock held by another instance, skipping cycle");
                 next_delay = probe.get_delay_after_scale();
                 continue;
             }
             Err(e) => {
-                warn!(probe_name = %probe.name, error = %e, "Lock acquisition failed, proceeding anyway");
+                if multi_instance {
+                    // Fail-closed: skipping this cycle preserves mutual exclusion guarantee
+                    error!(probe_name = %probe.name, error = %e,
+                           "Lock acquisition failed in multi-instance mode, skipping cycle");
+                    next_delay = probe.interval_seconds;
+                    continue;
+                }
+                // Single-instance: fail-open (backward-compatible)
+                warn!(probe_name = %probe.name, error = %e,
+                      "Lock acquisition failed, proceeding without lock");
+                None
             }
-            Ok(true) => {}
-        }
+            Ok(Some(token)) => Some(token),
+        };
 
         info!(
             probe_name = %probe.name,
@@ -214,6 +231,11 @@ pub async fn schedule_warpscript_probe(
                     probe_name = %probe.name,
                     "No Warp token available (neither app warp_token nor WARP_TOKEN env var set)"
                 );
+                if let Some(ref token) = lock_token {
+                    if let Err(e) = backend.release_lock(&lock_key, token).await {
+                        debug!(probe_name = %probe.name, error = %e, "Failed to release lock (will expire via TTL)");
+                    }
+                }
                 next_delay = probe.interval_seconds;
                 continue;
             }
@@ -226,6 +248,7 @@ pub async fn schedule_warpscript_probe(
             app_id,
             token,
             &endpoint,
+            probe.get_request_timeout(),
             &client,
         )
         .await
@@ -245,6 +268,11 @@ pub async fn schedule_warpscript_probe(
                     error = %e,
                     "WarpScript execution failed"
                 );
+                if let Some(ref token) = lock_token {
+                    if let Err(e) = backend.release_lock(&lock_key, token).await {
+                        debug!(probe_name = %probe.name, error = %e, "Failed to release lock (will expire via TTL)");
+                    }
+                }
                 // On error, keep current level and retry after interval
                 next_delay = probe.interval_seconds;
                 continue;
@@ -262,8 +290,7 @@ pub async fn schedule_warpscript_probe(
                 "Scaling UP detected"
             );
 
-            // Execute upscale command for current level
-            if let Some(level_config) = probe.get_level(current_level) {
+            let command_ok = if let Some(level_config) = probe.get_level(current_level) {
                 if let Some(ref cmd) = level_config.upscale_command {
                     if dry_run {
                         warn!(
@@ -273,6 +300,7 @@ pub async fn schedule_warpscript_probe(
                             to_level = new_level,
                             "DRY RUN: skipping upscale command"
                         );
+                        true
                     } else {
                         execute_scaling_command(
                             &probe.name,
@@ -281,19 +309,31 @@ pub async fn schedule_warpscript_probe(
                             probe.command_timeout_seconds,
                             "upscale",
                         )
-                        .await;
+                        .await
                     }
                 } else {
-                    debug!(
+                    warn!(
                         probe_name = %probe.name,
                         level = current_level,
-                        "No upscale command defined for this level"
+                        "No upscale command defined for this level — level transition skipped"
                     );
+                    false
                 }
-            }
+            } else {
+                true
+            };
 
-            current_level = new_level;
-            next_delay = probe.get_delay_after_scale();
+            if command_ok {
+                current_level = new_level;
+                next_delay = probe.get_delay_after_scale();
+            } else {
+                warn!(
+                    probe_name = %probe.name,
+                    current_level,
+                    "Scaling command failed — level not updated, will retry at next interval"
+                );
+                next_delay = probe.interval_seconds;
+            }
         }
         // Check if we should scale down
         else if probe.should_scale_down(current_level, value) {
@@ -306,8 +346,7 @@ pub async fn schedule_warpscript_probe(
                 "Scaling DOWN detected"
             );
 
-            // Execute downscale command for current level
-            if let Some(level_config) = probe.get_level(current_level) {
+            let command_ok = if let Some(level_config) = probe.get_level(current_level) {
                 if let Some(ref cmd) = level_config.downscale_command {
                     if dry_run {
                         warn!(
@@ -317,6 +356,7 @@ pub async fn schedule_warpscript_probe(
                             to_level = new_level,
                             "DRY RUN: skipping downscale command"
                         );
+                        true
                     } else {
                         execute_scaling_command(
                             &probe.name,
@@ -325,19 +365,31 @@ pub async fn schedule_warpscript_probe(
                             probe.command_timeout_seconds,
                             "downscale",
                         )
-                        .await;
+                        .await
                     }
                 } else {
-                    debug!(
+                    warn!(
                         probe_name = %probe.name,
                         level = current_level,
-                        "No downscale command defined for this level"
+                        "No downscale command defined for this level — level transition skipped"
                     );
+                    false
                 }
-            }
+            } else {
+                true
+            };
 
-            current_level = new_level;
-            next_delay = probe.get_delay_after_scale();
+            if command_ok {
+                current_level = new_level;
+                next_delay = probe.get_delay_after_scale();
+            } else {
+                warn!(
+                    probe_name = %probe.name,
+                    current_level,
+                    "Scaling command failed — level not updated, will retry at next interval"
+                );
+                next_delay = probe.interval_seconds;
+            }
         }
         // No scaling needed
         else {
@@ -367,8 +419,10 @@ pub async fn schedule_warpscript_probe(
             );
         }
 
-        if let Err(e) = backend.release_lock(&lock_key).await {
-            debug!(probe_name = %probe.name, error = %e, "Failed to release lock (will expire via TTL)");
+        if let Some(ref token) = lock_token {
+            if let Err(e) = backend.release_lock(&lock_key, token).await {
+                debug!(probe_name = %probe.name, error = %e, "Failed to release lock (will expire via TTL)");
+            }
         }
 
         debug!(
@@ -377,5 +431,28 @@ pub async fn schedule_warpscript_probe(
             level = current_level,
             "Scheduled next execution"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_scaling_command_failure_returns_false() {
+        let ok = execute_scaling_command("test", "exit 1", None, 5, "upscale").await;
+        assert!(!ok);
+    }
+
+    #[tokio::test]
+    async fn test_scaling_command_success_returns_true() {
+        let ok = execute_scaling_command("test", "true", None, 5, "upscale").await;
+        assert!(ok);
+    }
+
+    #[tokio::test]
+    async fn test_scaling_command_spawn_error_returns_false() {
+        let ok = execute_scaling_command("test", "nonexistent_xyz_cmd_42", None, 5, "upscale").await;
+        assert!(!ok);
     }
 }

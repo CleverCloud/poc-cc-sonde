@@ -1,10 +1,11 @@
 use reqwest::Client;
 use tracing::{debug, error, info};
 
+/// Maximum bytes read from a WarpScript response body (1 MiB).
+const MAX_WARP_BODY_BYTES: usize = 1024 * 1024;
+
 pub fn build_client() -> Result<Client, reqwest::Error> {
-    Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
+    Client::builder().build()
 }
 
 #[derive(Debug)]
@@ -28,13 +29,14 @@ impl std::error::Error for WarpScriptError {}
 
 /// Execute a WarpScript and return the scalar value.
 /// `script` is the script content (read once by the caller).
-/// `token` and `endpoint` are resolved once by the caller before the loop.
+/// `token`, `endpoint`, and `timeout_seconds` are resolved once by the caller before the loop.
 pub async fn execute_warpscript(
     probe_name: &str,
     script: &str,
     app_id: Option<&str>,
     token: &str,
     endpoint: &str,
+    timeout_seconds: u64,
     client: &Client,
 ) -> Result<f64, WarpScriptError> {
     // Substitute ${WARP_TOKEN} with actual token
@@ -56,13 +58,14 @@ pub async fn execute_warpscript(
 
     debug!(
         probe_name = %probe_name,
-        endpoint = %endpoint,
+        endpoint = %crate::utils::sanitize_url_for_log(endpoint),
         "Executing WarpScript"
     );
 
-    let response = client
+    let mut response = client
         .post(endpoint)
         .header("Content-Type", "text/plain")
+        .timeout(std::time::Duration::from_secs(timeout_seconds))
         .body(script)
         .send()
         .await
@@ -71,10 +74,26 @@ pub async fn execute_warpscript(
     let status = response.status();
 
     if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
+        let error_body = {
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        let remaining = MAX_WARP_BODY_BYTES.saturating_sub(buf.len());
+                        if remaining == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                        if buf.len() >= MAX_WARP_BODY_BYTES {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&buf).into_owned()
+        };
         error!(
             probe_name = %probe_name,
             status = %status,
@@ -87,10 +106,28 @@ pub async fn execute_warpscript(
         )));
     }
 
-    let body = response
-        .text()
-        .await
-        .map_err(|e| WarpScriptError::RequestError(e.to_string()))?;
+    let body = {
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    let remaining = MAX_WARP_BODY_BYTES.saturating_sub(buf.len());
+                    if remaining == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                    if buf.len() >= MAX_WARP_BODY_BYTES {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    return Err(WarpScriptError::RequestError(e.to_string()));
+                }
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    };
 
     debug!(
         probe_name = %probe_name,

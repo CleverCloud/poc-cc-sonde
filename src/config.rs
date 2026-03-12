@@ -100,6 +100,8 @@ pub struct WarpScriptProbe {
     pub interval_seconds: u64,
     #[serde(default = "default_timeout")]
     pub command_timeout_seconds: u64,
+    /// HTTP request timeout in seconds for WarpScript calls (defaults to 30)
+    pub request_timeout_seconds: Option<u64>,
     /// Delay after scaling up or down
     pub delay_after_scale_seconds: Option<u64>,
     /// Applications to manage (each with optional warp_token)
@@ -186,6 +188,10 @@ where
 }
 
 impl WarpScriptProbe {
+    pub fn get_request_timeout(&self) -> u64 {
+        self.request_timeout_seconds.unwrap_or(30)
+    }
+
     pub fn get_delay_after_scale(&self) -> u64 {
         self.delay_after_scale_seconds
             .unwrap_or(self.interval_seconds)
@@ -337,6 +343,13 @@ impl Config {
         for probe in &self.warpscript_probes {
             if probe.name.is_empty() {
                 return Err("WarpScript probe name cannot be empty".into());
+            }
+            if probe.interval_seconds == 0 {
+                return Err(format!(
+                    "WarpScript probe '{}' has invalid interval (must be > 0)",
+                    probe.name
+                )
+                .into());
             }
             if probe.levels.is_empty() {
                 return Err(format!(

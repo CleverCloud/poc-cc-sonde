@@ -51,6 +51,9 @@ A Rust application that periodically checks HTTP endpoints and executes shell co
 - **Liveness Endpoint** — optional HTTP server for meta-monitoring
 - **State Persistence** — in-memory (default) or Redis; survives restarts
 - **Dry Run Mode** — `--dry-run` flag executes all probes and persists state, but skips all remediation commands; safe for config validation and threshold tuning
+- **Multi-Instance Mode** — `--multi-instance` (or `MULTI_INSTANCE=true`) enforces that Redis is available; the process exits fatally on connection failure instead of silently falling back to in-memory, preventing split-brain across replicas
+- **Bounded Response Body Reads** — HTTP responses are read chunk-by-chunk and capped at 1 MiB; a gigantic response body never causes unbounded memory consumption
+- **Credential Sanitisation in Logs** — all URLs (Redis, HTTP endpoints) are sanitised before logging; `://user:PASSWORD@host` credentials are masked as `****` regardless of scheme
 - **Structured Logging** — `tracing`-based, configurable via `RUST_LOG`
 - **TOML Configuration** — human-readable, validated at startup
 
@@ -90,6 +93,10 @@ cargo build --release --features redis-persistence
 
 # Dry run: execute all probes but skip remediation commands
 ./target/release/cc-sonde --dry-run
+
+# Multi-instance mode: require Redis; exit fatally if Redis is unavailable
+./target/release/cc-sonde --multi-instance
+MULTI_INSTANCE=true ./target/release/cc-sonde
 ```
 
 ### Command-Line Options
@@ -106,6 +113,9 @@ Options:
           Port for health check server (requires --healthcheck) [default: 8080]
       --dry-run
           Dry run mode: probe checks are executed but remediation commands are not
+      --multi-instance
+          Multi-instance mode: Redis is required for distributed locking.
+          Can also be set via the MULTI_INSTANCE environment variable.
   -h, --help
           Print help
   -V, --version
@@ -157,6 +167,47 @@ WARN probe_name="cpu-scaler" command="clever scale --app app1 --min-instances 2"
 - Validate a new configuration file against a real environment without side effects.
 - Tune scaling thresholds by observing which levels would be triggered.
 - Test the monitoring pipeline in a staging environment that shares infrastructure with production.
+
+---
+
+## Multi-Instance Mode
+
+When multiple replicas share a Redis backend, the distributed lock mechanism guarantees that **exactly one instance** executes a given probe during each cycle. If one instance holds the lock, others skip that cycle and wait for the next interval.
+
+By default, if the Redis connection fails at startup, the application falls back to in-memory persistence silently. In a multi-instance deployment this is dangerous: each replica would run independently, producing duplicate remediation commands and inconsistent state — a **split-brain** scenario.
+
+Use `--multi-instance` (or `MULTI_INSTANCE=true`) to make the process exit fatally instead of silently degrading:
+
+```bash
+# Binary flag
+./target/release/cc-sonde --multi-instance
+
+# Environment variable (useful in container deployments)
+MULTI_INSTANCE=true ./target/release/cc-sonde
+```
+
+At startup a `WARN` entry is emitted:
+
+```
+WARN cc_sonde: Multi-instance mode enabled: Redis is required for distributed locking
+```
+
+If Redis is unreachable, the process prints an error message and exits with code 1:
+
+```
+Fatal: Redis connection failed in multi-instance mode: …
+```
+
+### Requirements and constraints
+
+| Condition | `--multi-instance` absent | `--multi-instance` present |
+|-----------|--------------------------|---------------------------|
+| No Redis config | In-memory (normal) | In-memory (normal) |
+| Redis config, connection OK | Redis backend | Redis backend |
+| Redis config, connection fails | Falls back to in-memory (error log) | **Fatal exit (code 1)** |
+| Redis config, feature not compiled in | Warning, in-memory | **Fatal exit (code 1)** |
+
+Single-instance deployments do not need this flag. Use it in any Kubernetes / Docker Swarm / ECS configuration where several pods or containers share the same Redis instance.
 
 ---
 
@@ -363,7 +414,7 @@ downscale_command = "clever scale --app ${APP_ID} --min-instances 2"
 |-----|----------|---------|-------------|
 | `name` | yes | — | Unique descriptive name |
 | `warpscript_file` | yes | — | Path to the `.mc2` file. Read once at startup (with retry); restart required to pick up changes. |
-| `interval_seconds` | yes | — | Default interval between executions |
+| `interval_seconds` | yes | — | Default interval between executions. Must be > 0. |
 | `command_timeout_seconds` | no | `30` | Maximum execution time for scaling commands (seconds) |
 | `delay_after_scale_seconds` | no | `interval_seconds` | Wait time after any scaling action (up or down) |
 | `apps` | no | `[]` | List of apps to manage; each creates an independent probe instance |
@@ -385,8 +436,8 @@ At least one level must be defined. Level numbers must be unique and contiguous 
 | `levels` | yes* | Multiple level numbers — use `levels = [N, M, …]` for levels sharing identical config |
 | `scale_up_threshold` | no | If the metric value exceeds this, scale up. Ignored at the maximum level. |
 | `scale_down_threshold` | no | If the metric value drops below this, scale down. Ignored at the minimum level. |
-| `upscale_command` | no | Shell command executed when scaling up from this level |
-| `downscale_command` | no | Shell command executed when scaling down from this level |
+| `upscale_command` | no | Shell command executed when scaling up from this level. **If absent and an upscale is triggered, the transition is blocked and a `WARN` is logged.** Use `upscale_command = "true"` for a deliberate no-op. |
+| `downscale_command` | no | Shell command executed when scaling down from this level. **If absent and a downscale is triggered, the transition is blocked and a `WARN` is logged.** Use `downscale_command = "true"` for a deliberate no-op. |
 
 *`level` and `levels` are mutually exclusive; exactly one must be present per entry.
 
@@ -422,8 +473,8 @@ Level entries are sorted by level number after deserialization, regardless of de
 2. At each interval, `${WARP_TOKEN}` and `${APP_ID}` are substituted into the cached script, and it is sent via HTTP POST to `WARP_ENDPOINT`.
 3. The last element of the JSON response array is used as the metric value (must be a number).
 4. The value is compared against the **current level's** thresholds:
-   - `value > scale_up_threshold` → execute `upscale_command`, increment level
-   - `value < scale_down_threshold` → execute `downscale_command`, decrement level
+   - `value > scale_up_threshold` → execute `upscale_command`, increment level (if the command succeeds). If `upscale_command` is absent for this level, the transition is **blocked**: a `WARN` is logged and the level is not updated. Configure `upscale_command = "true"` for a deliberate no-op.
+   - `value < scale_down_threshold` → execute `downscale_command`, decrement level (if the command succeeds). If `downscale_command` is absent for this level, the transition is **blocked**: a `WARN` is logged and the level is not updated. Configure `downscale_command = "true"` for a deliberate no-op.
    - Otherwise → no action, wait `interval_seconds`
 5. Boundaries: upscale is ignored at max level; downscale is ignored at min level.
 6. After any scaling action, wait `delay_after_scale_seconds` before the next check.
@@ -474,6 +525,7 @@ The script must leave exactly one numeric value on the stack; the last element o
 - **Cooldown**: use `delay_after_scale_seconds` to let the system stabilize before re-evaluating.
 - **Progressive thresholds**: use higher up-thresholds at higher levels (e.g., 70% → level 2, 85% → level 3).
 - **Script changes**: the WarpScript file is read once at startup. Restart the application to pick up edits.
+- **Explicit no-op commands**: if a level should change without running any external command (e.g., the boundary level where only one direction is possible and you want the counter to advance anyway), set `upscale_command = "true"` or `downscale_command = "true"`. Leaving the field absent intentionally **blocks** the transition to prevent silent state drift.
 
 ---
 
@@ -481,12 +533,13 @@ The script must leave exactly one numeric value on the stack; the last element o
 
 | Variable | Used by | Required | Description |
 |----------|---------|----------|-------------|
-| `WARP_ENDPOINT` | WarpScript probes | yes (if any WarpScript probe) | URL of the Warp 10 exec API. Validated at startup; never logged at `info`. |
+| `WARP_ENDPOINT` | WarpScript probes | yes (if any WarpScript probe) | URL of the Warp 10 exec API. Validated at startup; logged only at `debug` with credentials masked. |
 | `WARP_TOKEN` | WarpScript probes | no | Fallback read token for apps without a per-app `warp_token`. Never logged. |
 | `REDIS_URL` | Persistence | no | Full Redis connection URL (takes precedence over individual vars). |
 | `REDIS_HOST` | Persistence | no | Redis hostname (used only if `REDIS_URL` is not set). |
 | `REDIS_PORT` | Persistence | no | Redis port (default: `6379`). |
-| `REDIS_PASSWORD` | Persistence | no | Redis password (masked in logs). |
+| `REDIS_PASSWORD` | Persistence | no | Redis password. Percent-encoded automatically to handle special characters (`@`, `:`, `/`, …). Masked in logs. |
+| `MULTI_INSTANCE` | Startup | no | Set to `true` to enable multi-instance mode (equivalent to `--multi-instance`). |
 | `RUST_LOG` | Logging | no | Log level filter (default: `info`). See [Logging](#logging). |
 
 ---
@@ -504,9 +557,17 @@ on_failure_command = "echo 'Alert' | mail -s 'App down' ops@example.com"
 
 ### Timeout and Process Group Cleanup
 
-If a command exceeds `command_timeout_seconds`, the **entire process group** is killed (`SIGKILL` on the group) on Linux/macOS. This ensures that pipelines, sub-shells, and grandchildren are all terminated, not just the top-level `sh` process.
+On Linux/macOS, every spawned command is placed in its own **process group**. A RAII guard (`ProcessGroupKillOnDrop`) targets the entire group, not just the top-level `sh` process:
 
-On non-Unix platforms, only the direct child process is killed via `kill_on_drop`.
+| Outcome | Guard state | Effect |
+|---------|-------------|--------|
+| Command times out (`command_timeout_seconds` exceeded) | Armed | `SIGKILL` sent to the whole process group on drop — pipelines and sub-shells terminated |
+| Task cancelled / probe aborted (e.g. `SIGTERM` received) | Armed | `SIGKILL` sent to the whole process group on drop |
+| Command exits normally (`sh` returns) | **Disarmed** | Process group is **not** killed — background jobs started with `&` (intentional daemonisation) survive |
+
+This means that a command such as `my-daemon &` will leave the daemon running after normal completion, which is the expected behaviour. Only timeout or cancellation triggers the group kill.
+
+On non-Unix platforms, only the direct child process is killed via Tokio's `kill_on_drop`.
 
 ### Logging Behaviour
 
@@ -549,13 +610,26 @@ export REDIS_PORT="6379"           # optional, default 6379
 export REDIS_PASSWORD="mypassword" # optional
 ```
 
-The Redis URL (including any embedded password) is **never written to logs**. Only a masked form is logged at startup.
+The Redis URL (including any embedded password) is **never written to logs**. Only a masked form (`://user:****@host`) is logged at startup.
+
+`REDIS_PASSWORD` may contain any character. Special characters (`@`, `:`, `/`, `#`, `?`) are percent-encoded before the URL is constructed, so an unencoded password in the environment variable always produces a valid Redis URL.
 
 Redis keys used:
 - `poc-sonde:probe:<probe-name>` — healthcheck probe state
 - `poc-sonde:warpscript:<probe-name>` — WarpScript probe state
+- `poc-sonde:lock:warpscript:<probe-name>` — distributed lock (WarpScript probes)
+- `poc-sonde:lock:healthcheck:<probe-name>` — distributed lock (healthcheck probes)
 
-If the Redis connection fails at startup, the application falls back to in-memory persistence with an `error` log entry.
+**Distributed lock token**: each lock acquisition generates a **UUID v4** token. The compare-and-delete release script (`GETDEL` via Lua) only removes the key if the stored token matches the caller's token. UUID v4 tokens are globally unique regardless of process PID or wall-clock time, which prevents a replica with PID 1 (common in containers) from accidentally stealing or releasing another instance's lock when two replicas start within the same second.
+
+**Connection failure behaviour:**
+
+| Mode | Redis fails at startup |
+|------|------------------------|
+| Default (no flag) | Falls back to in-memory — `error` log, continues running |
+| `--multi-instance` | **Fatal exit (code 1)** — prevents split-brain |
+
+When running with the Redis backend, the distributed lock TTL is computed as `WARP_REQUEST_TIMEOUT_SECS (30) + command_timeout_seconds + 10` seconds, ensuring the lock outlives the longest possible execution even when `interval_seconds` is shorter than the HTTP timeout.
 
 ### Level Validation on Restart
 
@@ -616,6 +690,7 @@ Log format:
 | Application startup, configuration summary | `info` | |
 | Probe results (success / failure) | `info` | |
 | Redis URL (masked) | `info` | Password replaced with `****` |
+| HTTP probe URLs | `info` / `debug` | Credentials masked if present (`://user:****@host`) |
 | Remediation actions (threshold reached, scaling detected, commands executed) | `warn` | Visible with `RUST_LOG=warn` |
 | Command exit codes on non-zero | `warn` | |
 | Command stderr (on non-zero exit) | `warn` | |
@@ -667,7 +742,12 @@ cargo clippy -- -D warnings
 | Scaling level reset to minimum after restart | The previously persisted level is not in the current config; expected behaviour after reducing the number of levels |
 | Command times out but child processes keep running | Should not happen on Linux/macOS — the whole process group is killed. On other platforms, only `sh` is killed. |
 | `Redis URL provided but redis-persistence feature is not enabled` | Rebuild with `cargo build --features redis-persistence` |
-| Redis connection fails at startup | Application falls back to in-memory persistence; check `REDIS_URL` / `REDIS_HOST` and network reachability |
+| Redis connection fails at startup | Without `--multi-instance`: falls back to in-memory (error log). With `--multi-instance`: fatal exit. Check `REDIS_URL` / `REDIS_HOST` and network reachability. |
+| `Fatal: Redis connection failed in multi-instance mode: …` | `--multi-instance` is active but Redis is unreachable. Fix the Redis config or remove `--multi-instance` for single-instance deployments. |
+| `WarpScript probe '…' has invalid interval (must be > 0)` | `interval_seconds = 0` is not allowed for WarpScript probes; set a positive value |
+| `REDIS_PASSWORD` with special characters breaks the Redis URL | Since audit round 5 this is handled automatically via percent-encoding; ensure you are running the current build |
+| Scaling level does not advance despite threshold being crossed | `upscale_command` / `downscale_command` is not configured for that level. Absent commands block level transitions to prevent state drift. Add `upscale_command = "true"` for a deliberate no-op. |
+| Background process started with `&` is killed immediately after command exits | Should not happen — the process group SIGKILL guard is disarmed on normal command completion. Verify you are running the current build (audit round 8 fix). |
 
 ---
 
@@ -678,9 +758,11 @@ cargo clippy -- -D warnings
 - **Shell execution surface**: all commands are run via `sh -c` to support pipes and shell operators. The **content** of `on_failure_command`, `upscale_command`, and `downscale_command` is not otherwise validated and is the responsibility of the administrator who writes the configuration file. Only trusted administrators should have write access to the TOML file.
 - **Tokens in configuration**: prefer the `WARP_TOKEN` environment variable over inline `warp_token` values in the TOML file. Environment variables are not stored on disk and are less likely to be accidentally committed to version control or exposed in file system backups. Use inline `warp_token` only for local development or when environment variable injection is not available.
 - **Command logging**: command strings are only logged at `debug` level, as they may contain tokens or passwords. Run with `RUST_LOG=info` (the default) in production to avoid exposing them.
-- **`WARP_ENDPOINT` logging**: logged only at `debug` level, since query parameters or credentials may be embedded in the URL.
-- **Redis passwords**: masked before being logged; the raw URL is never written to any log output.
+- **URL credential sanitisation**: all URLs — Redis, WarpScript endpoints, and HTTP probe endpoints — are sanitised before being passed to the logger. Any `://user:PASSWORD@host` authority is masked as `://user:****@host`, regardless of scheme. This applies to both `info` and `debug` log levels.
+- **`WARP_ENDPOINT` logging**: logged only at `debug` level and sanitised; never logged at `info`.
+- **Redis passwords**: percent-encoded at URL construction time (so special characters do not corrupt the URL), then masked in all log output. The raw password is never written anywhere.
 - **stdout**: command stdout is never logged (it may contain sensitive data). Only stderr is logged, and only on non-zero exit.
+- **Multi-instance fail-safe**: without `--multi-instance`, a Redis failure causes a silent fallback to in-memory. In a multi-replica deployment, enable `--multi-instance` so that the process exits rather than producing split-brain behaviour.
 
 ---
 
