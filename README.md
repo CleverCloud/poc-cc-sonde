@@ -139,11 +139,11 @@ WARN cc_sonde: Dry run mode enabled: remediation commands will not be executed
 | Internal state (failure counter, scaling level, timestamps) | Updated normally |
 | Persistence (in-memory / Redis) | Saved normally |
 
-When a command would have been executed, an `INFO` log is emitted instead:
+When a command would have been executed, a `WARN` log is emitted instead:
 
 ```
-INFO probe_name="my-api" command="systemctl restart my-service" DRY RUN: skipping failure command
-INFO probe_name="cpu-scaler" command="clever scale --app app1 --min-instances 2" from_level=1 to_level=2 DRY RUN: skipping upscale command
+WARN probe_name="my-api" command="systemctl restart my-service" DRY RUN: skipping failure command
+WARN probe_name="cpu-scaler" command="clever scale --app app1 --min-instances 2" from_level=1 to_level=2 DRY RUN: skipping upscale command
 ```
 
 ### Behaviour details
@@ -614,9 +614,10 @@ Log format:
 | Information | Level | Notes |
 |-------------|-------|-------|
 | Application startup, configuration summary | `info` | |
-| Probe results (success / failure / scaling decisions) | `info` | |
+| Probe results (success / failure) | `info` | |
 | Redis URL (masked) | `info` | Password replaced with `****` |
-| Command exit codes | `info` / `warn` | `info` on success, `warn` on non-zero |
+| Remediation actions (threshold reached, scaling detected, commands executed) | `warn` | Visible with `RUST_LOG=warn` |
+| Command exit codes on non-zero | `warn` | |
 | Command stderr (on non-zero exit) | `warn` | |
 | `WARP_ENDPOINT` value | `debug` | Not emitted at `info` |
 | Command strings | `debug` | May contain tokens or passwords |

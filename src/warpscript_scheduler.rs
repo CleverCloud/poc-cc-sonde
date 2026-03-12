@@ -24,13 +24,13 @@ async fn execute_scaling_command(
         command.to_string()
     };
 
-    info!(probe_name = %probe_name, action = %action, "Executing {} command", action);
+    warn!(probe_name = %probe_name, action = %action, "Executing {} command", action);
     debug!(command = %cmd, "Scaling command detail");
 
     match executor::execute_command(&cmd, timeout_seconds).await {
         Ok(output) => {
             if output.status.success() {
-                info!(
+                warn!(
                     probe_name = %probe_name,
                     "{} command completed successfully", action
                 );
@@ -254,7 +254,7 @@ pub async fn schedule_warpscript_probe(
         // Check if we should scale up
         if probe.should_scale_up(current_level, value) {
             let new_level = current_level + 1;
-            info!(
+            warn!(
                 probe_name = %probe.name,
                 from_level = current_level,
                 to_level = new_level,
@@ -266,7 +266,7 @@ pub async fn schedule_warpscript_probe(
             if let Some(level_config) = probe.get_level(current_level) {
                 if let Some(ref cmd) = level_config.upscale_command {
                     if dry_run {
-                        info!(
+                        warn!(
                             probe_name = %probe.name,
                             command = %cmd,
                             from_level = current_level,
@@ -298,7 +298,7 @@ pub async fn schedule_warpscript_probe(
         // Check if we should scale down
         else if probe.should_scale_down(current_level, value) {
             let new_level = current_level - 1;
-            info!(
+            warn!(
                 probe_name = %probe.name,
                 from_level = current_level,
                 to_level = new_level,
@@ -310,7 +310,7 @@ pub async fn schedule_warpscript_probe(
             if let Some(level_config) = probe.get_level(current_level) {
                 if let Some(ref cmd) = level_config.downscale_command {
                     if dry_run {
-                        info!(
+                        warn!(
                             probe_name = %probe.name,
                             command = %cmd,
                             from_level = current_level,

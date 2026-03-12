@@ -140,7 +140,7 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>, 
                             command.clone()
                         };
 
-                        info!(
+                        warn!(
                             probe_name = %probe.name,
                             consecutive_failures = consecutive_failures,
                             threshold = retry_threshold,
@@ -149,7 +149,7 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>, 
                         debug!(command = %command, "Failure command detail");
 
                         if dry_run {
-                            info!(
+                            warn!(
                                 probe_name = %probe.name,
                                 command = %command,
                                 "DRY RUN: skipping failure command"
@@ -162,7 +162,7 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>, 
                                 Ok(output) => {
                                     if output.status.success() {
                                         command_succeeded = true;
-                                        info!(
+                                        warn!(
                                             probe_name = %probe.name,
                                             "Failure command completed successfully"
                                         );
