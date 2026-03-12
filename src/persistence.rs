@@ -43,6 +43,13 @@ pub trait PersistenceBackend: Send + Sync {
         &self,
         probe_name: &str,
     ) -> Result<Option<WarpScriptProbeState>, Box<dyn std::error::Error>>;
+
+    async fn acquire_lock(
+        &self,
+        key: &str,
+        ttl_ms: u64,
+    ) -> Result<bool, Box<dyn std::error::Error>>;
+    async fn release_lock(&self, key: &str) -> Result<(), Box<dyn std::error::Error>>;
 }
 
 // In-memory implementation (default)
@@ -104,6 +111,18 @@ impl PersistenceBackend for InMemoryBackend {
         let states = self.warpscript_states.lock().await;
         Ok(states.get(probe_name).cloned())
     }
+
+    async fn acquire_lock(
+        &self,
+        _key: &str,
+        _ttl_ms: u64,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        Ok(true)
+    }
+
+    async fn release_lock(&self, _key: &str) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
 }
 
 // Redis implementation (optional)
@@ -129,6 +148,7 @@ impl RedisBackend {
     fn get_key(probe_name: &str) -> String {
         format!("poc-sonde:probe:{}", probe_name)
     }
+
 }
 
 #[cfg(feature = "redis-persistence")]
@@ -227,6 +247,33 @@ impl PersistenceBackend for RedisBackend {
                 Ok(None)
             }
         }
+    }
+
+    async fn acquire_lock(
+        &self,
+        key: &str,
+        ttl_ms: u64,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let mut con = self.client.get_multiplexed_async_connection().await?;
+        let token = format!("{}:{}", std::process::id(), current_timestamp());
+        let result: Option<String> = redis::cmd("SET")
+            .arg(key)
+            .arg(&token)
+            .arg("NX")
+            .arg("PX")
+            .arg(ttl_ms as usize)
+            .query_async(&mut con)
+            .await?;
+        Ok(result.is_some())
+    }
+
+    async fn release_lock(&self, key: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let mut con = self.client.get_multiplexed_async_connection().await?;
+        redis::cmd("DEL")
+            .arg(key)
+            .query_async::<usize>(&mut con)
+            .await?;
+        Ok(())
     }
 }
 

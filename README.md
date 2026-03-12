@@ -9,6 +9,7 @@ A Rust application that periodically checks HTTP endpoints and executes shell co
 - [Features](#features)
 - [Installation](#installation)
 - [Usage](#usage)
+- [Dry Run Mode](#dry-run-mode)
 - [Configuration](#configuration)
   - [Healthcheck Probes](#healthcheck-probes)
   - [WarpScript Probes](#warpscript-probes-auto-scaling)
@@ -49,6 +50,7 @@ A Rust application that periodically checks HTTP endpoints and executes shell co
 - **Graceful Shutdown** — handles `SIGTERM` (containers, systemd) and `SIGINT` (Ctrl+C)
 - **Liveness Endpoint** — optional HTTP server for meta-monitoring
 - **State Persistence** — in-memory (default) or Redis; survives restarts
+- **Dry Run Mode** — `--dry-run` flag executes all probes and persists state, but skips all remediation commands; safe for config validation and threshold tuning
 - **Structured Logging** — `tracing`-based, configurable via `RUST_LOG`
 - **TOML Configuration** — human-readable, validated at startup
 
@@ -85,6 +87,9 @@ cargo build --release --features redis-persistence
 
 # Custom port
 ./target/release/cc-sonde --healthcheck --healthcheck-port 9090
+
+# Dry run: execute all probes but skip remediation commands
+./target/release/cc-sonde --dry-run
 ```
 
 ### Command-Line Options
@@ -99,11 +104,59 @@ Options:
           Enable health check HTTP server
       --healthcheck-port <HEALTHCHECK_PORT>
           Port for health check server (requires --healthcheck) [default: 8080]
+      --dry-run
+          Dry run mode: probe checks are executed but remediation commands are not
   -h, --help
           Print help
   -V, --version
           Print version
 ```
+
+---
+
+## Dry Run Mode
+
+The `--dry-run` flag lets you run cc-sonde with full probe execution — HTTP checks, WarpScript queries, state persistence, failure counters — while **skipping all external remediation commands**.
+
+```bash
+./target/release/cc-sonde --config config.toml --dry-run
+```
+
+At startup, a `WARN` entry is emitted to make the mode visible:
+
+```
+WARN cc_sonde: Dry run mode enabled: remediation commands will not be executed
+```
+
+### What runs vs. what is skipped
+
+| Action | Dry run |
+|--------|---------|
+| HTTP health check (GET to monitored service) | Executed normally |
+| WarpScript query (POST to Warp 10 endpoint) | Executed normally |
+| `on_failure_command` | **Skipped** — logged instead |
+| `upscale_command` / `downscale_command` | **Skipped** — logged instead |
+| Internal state (failure counter, scaling level, timestamps) | Updated normally |
+| Persistence (in-memory / Redis) | Saved normally |
+
+When a command would have been executed, an `INFO` log is emitted instead:
+
+```
+INFO probe_name="my-api" command="systemctl restart my-service" DRY RUN: skipping failure command
+INFO probe_name="cpu-scaler" command="clever scale --app app1 --min-instances 2" from_level=1 to_level=2 DRY RUN: skipping upscale command
+```
+
+### Behaviour details
+
+- When a failure command is skipped, the scheduler treats it as if the command had **succeeded**: the next delay will be `delay_after_command_success_seconds`. This simulates the nominal recovery path.
+- When a scaling command is skipped, `current_level` is still updated. The probe tracks the level it *would* be at, so threshold logic remains coherent across cycles.
+- Removing `--dry-run` resumes normal operation with no further changes required.
+
+### Typical use cases
+
+- Validate a new configuration file against a real environment without side effects.
+- Tune scaling thresholds by observing which levels would be triggered.
+- Test the monitoring pipeline in a staging environment that shares infrastructure with production.
 
 ---
 

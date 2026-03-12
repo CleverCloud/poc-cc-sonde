@@ -9,7 +9,7 @@ mod warpscript_scheduler;
 
 use clap::Parser;
 use std::env;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
@@ -26,6 +26,10 @@ struct Args {
     /// Port for health check server (requires --healthcheck)
     #[arg(long, default_value_t = 8080)]
     healthcheck_port: u16,
+
+    /// Dry run mode: probe checks are executed but remediation commands are not
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
 }
 
 /// Get Redis URL from environment variables
@@ -96,6 +100,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting HTTP monitoring application");
 
+    if args.dry_run {
+        warn!("Dry run mode enabled: remediation commands will not be executed");
+    }
+
     // Load and validate configuration
     info!(config_path = %args.config, "Loading configuration");
     let config = config::Config::from_file(&args.config)?;
@@ -156,7 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let backend_clone = backend.clone();
-            let handle = tokio::spawn(healthcheck_scheduler::schedule_probe(probe, backend_clone));
+            let handle = tokio::spawn(healthcheck_scheduler::schedule_probe(probe, backend_clone, args.dry_run));
             handles.push(handle);
         } else {
             // With apps: create one probe instance per app
@@ -185,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let handle = tokio::spawn(healthcheck_scheduler::schedule_probe(
                     probe_instance,
                     backend_clone,
+                    args.dry_run,
                 ));
                 handles.push(handle);
             }
@@ -208,6 +217,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let handle = tokio::spawn(warpscript_scheduler::schedule_warpscript_probe(
                 probe,
                 backend_clone,
+                args.dry_run,
             ));
             handles.push(handle);
         } else {
@@ -240,6 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let handle = tokio::spawn(warpscript_scheduler::schedule_warpscript_probe(
                     probe_instance,
                     backend_clone,
+                    args.dry_run,
                 ));
                 handles.push(handle);
             }

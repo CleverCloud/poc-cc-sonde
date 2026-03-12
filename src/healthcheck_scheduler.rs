@@ -5,9 +5,9 @@ use crate::persistence::{self, PersistenceBackend, ProbeState};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) {
+pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>, dry_run: bool) {
     // Build the HTTP client once and reuse across all iterations
     let client = match healthcheck_probe::build_client() {
         Ok(c) => c,
@@ -76,6 +76,21 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) 
             time::sleep(Duration::from_secs(next_delay)).await;
         }
 
+        let lock_key = format!("poc-sonde:lock:probe:{}", probe.name);
+        let ttl_ms = (probe.interval_seconds + probe.command_timeout_seconds + 10) * 1000;
+
+        match backend.acquire_lock(&lock_key, ttl_ms).await {
+            Ok(false) => {
+                debug!(probe_name = %probe.name, "Lock held by another instance, skipping cycle");
+                next_delay = probe.get_delay_after_success();
+                continue;
+            }
+            Err(e) => {
+                warn!(probe_name = %probe.name, error = %e, "Lock acquisition failed, proceeding anyway");
+            }
+            Ok(true) => {}
+        }
+
         info!(
             probe_name = %probe.name,
             "Executing scheduled probe"
@@ -133,30 +148,39 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) 
                         );
                         debug!(command = %command, "Failure command detail");
 
-                        match executor::execute_command(&command, probe.command_timeout_seconds)
-                            .await
-                        {
-                            Ok(output) => {
-                                if output.status.success() {
-                                    command_succeeded = true;
-                                    info!(
-                                        probe_name = %probe.name,
-                                        "Failure command completed successfully"
-                                    );
-                                } else {
+                        if dry_run {
+                            info!(
+                                probe_name = %probe.name,
+                                command = %command,
+                                "DRY RUN: skipping failure command"
+                            );
+                            command_succeeded = true;
+                        } else {
+                            match executor::execute_command(&command, probe.command_timeout_seconds)
+                                .await
+                            {
+                                Ok(output) => {
+                                    if output.status.success() {
+                                        command_succeeded = true;
+                                        info!(
+                                            probe_name = %probe.name,
+                                            "Failure command completed successfully"
+                                        );
+                                    } else {
+                                        error!(
+                                            probe_name = %probe.name,
+                                            exit_code = output.status.code().unwrap_or(-1),
+                                            "Failure command completed with errors"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
                                     error!(
                                         probe_name = %probe.name,
-                                        exit_code = output.status.code().unwrap_or(-1),
-                                        "Failure command completed with errors"
+                                        error = %e,
+                                        "Failed to execute failure command"
                                     );
                                 }
-                            }
-                            Err(e) => {
-                                error!(
-                                    probe_name = %probe.name,
-                                    error = %e,
-                                    "Failed to execute failure command"
-                                );
                             }
                         }
                     } else {
@@ -201,6 +225,10 @@ pub async fn schedule_probe(probe: Probe, backend: Arc<dyn PersistenceBackend>) 
                 error = %e,
                 "Failed to save state"
             );
+        }
+
+        if let Err(e) = backend.release_lock(&lock_key).await {
+            debug!(probe_name = %probe.name, error = %e, "Failed to release lock (will expire via TTL)");
         }
 
         debug!(

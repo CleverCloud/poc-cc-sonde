@@ -55,6 +55,7 @@ async fn execute_scaling_command(
 pub async fn schedule_warpscript_probe(
     probe: WarpScriptProbe,
     backend: Arc<dyn PersistenceBackend>,
+    dry_run: bool,
 ) {
     // Build the HTTP client once and reuse across all iterations
     let client = match warpscript_probe::build_client() {
@@ -178,6 +179,21 @@ pub async fn schedule_warpscript_probe(
             time::sleep(Duration::from_secs(next_delay)).await;
         }
 
+        let lock_key = format!("poc-sonde:lock:warpscript:{}", probe.name);
+        let ttl_ms = (probe.interval_seconds + probe.command_timeout_seconds + 10) * 1000;
+
+        match backend.acquire_lock(&lock_key, ttl_ms).await {
+            Ok(false) => {
+                debug!(probe_name = %probe.name, "Lock held by another instance, skipping cycle");
+                next_delay = probe.get_delay_after_scale();
+                continue;
+            }
+            Err(e) => {
+                warn!(probe_name = %probe.name, error = %e, "Lock acquisition failed, proceeding anyway");
+            }
+            Ok(true) => {}
+        }
+
         info!(
             probe_name = %probe.name,
             current_level = current_level,
@@ -249,14 +265,24 @@ pub async fn schedule_warpscript_probe(
             // Execute upscale command for current level
             if let Some(level_config) = probe.get_level(current_level) {
                 if let Some(ref cmd) = level_config.upscale_command {
-                    execute_scaling_command(
-                        &probe.name,
-                        cmd,
-                        app_id,
-                        probe.command_timeout_seconds,
-                        "upscale",
-                    )
-                    .await;
+                    if dry_run {
+                        info!(
+                            probe_name = %probe.name,
+                            command = %cmd,
+                            from_level = current_level,
+                            to_level = new_level,
+                            "DRY RUN: skipping upscale command"
+                        );
+                    } else {
+                        execute_scaling_command(
+                            &probe.name,
+                            cmd,
+                            app_id,
+                            probe.command_timeout_seconds,
+                            "upscale",
+                        )
+                        .await;
+                    }
                 } else {
                     debug!(
                         probe_name = %probe.name,
@@ -283,14 +309,24 @@ pub async fn schedule_warpscript_probe(
             // Execute downscale command for current level
             if let Some(level_config) = probe.get_level(current_level) {
                 if let Some(ref cmd) = level_config.downscale_command {
-                    execute_scaling_command(
-                        &probe.name,
-                        cmd,
-                        app_id,
-                        probe.command_timeout_seconds,
-                        "downscale",
-                    )
-                    .await;
+                    if dry_run {
+                        info!(
+                            probe_name = %probe.name,
+                            command = %cmd,
+                            from_level = current_level,
+                            to_level = new_level,
+                            "DRY RUN: skipping downscale command"
+                        );
+                    } else {
+                        execute_scaling_command(
+                            &probe.name,
+                            cmd,
+                            app_id,
+                            probe.command_timeout_seconds,
+                            "downscale",
+                        )
+                        .await;
+                    }
                 } else {
                     debug!(
                         probe_name = %probe.name,
@@ -329,6 +365,10 @@ pub async fn schedule_warpscript_probe(
                 error = %e,
                 "Failed to save WarpScript state"
             );
+        }
+
+        if let Err(e) = backend.release_lock(&lock_key).await {
+            debug!(probe_name = %probe.name, error = %e, "Failed to release lock (will expire via TTL)");
         }
 
         debug!(
