@@ -606,6 +606,7 @@ pub async fn schedule_warpscript_probe(
                     if !probe.is_stateless() {
                         current_level += 1;
                     }
+                    let now = persistence::current_timestamp();
                     upscale_blocked_until   = now + probe.delay_after_upscale_then_upscale();
                     downscale_blocked_until = now + probe.delay_after_upscale_then_downscale();
                     next_delay = upscale_blocked_until.min(downscale_blocked_until).saturating_sub(now);
@@ -734,6 +735,7 @@ pub async fn schedule_warpscript_probe(
                     if !probe.is_stateless() {
                         current_level -= 1;
                     }
+                    let now = persistence::current_timestamp();
                     downscale_blocked_until = now + probe.delay_after_downscale_then_downscale();
                     upscale_blocked_until   = now + probe.delay_after_downscale_then_upscale();
                     next_delay = upscale_blocked_until.min(downscale_blocked_until).saturating_sub(now);
