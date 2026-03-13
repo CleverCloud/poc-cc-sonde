@@ -159,7 +159,7 @@ WARN probe_name="cpu-scaler" command="clever scale --app app1 --flavor M --insta
 
 ### Behaviour details
 
-- When a failure command is skipped, the scheduler treats it as if the command had **succeeded**: the next delay will be `delay_after_command_success_seconds`. This simulates the nominal recovery path.
+- When a failure command is skipped, the scheduler treats it as if the command had **succeeded**: the next delay will be `delay_after_command_success_seconds` (healthcheck) or `delay_after_onf_command_success_seconds` (WarpScript). This simulates the nominal recovery path.
 - When a scaling command is skipped, `current_level` is still updated. The probe tracks the level it *would* be at, so threshold logic remains coherent across cycles.
 - Removing `--dry-run` resumes normal operation with no further changes required.
 
@@ -413,8 +413,8 @@ delay_after_scale_seconds = 120
 # Optional failure handling
 on_failure_command = "curl -s https://ops.example.com/alert?probe=${APP_ID}"
 failure_retries_before_command = 2
-delay_after_command_success_seconds = 300
-delay_after_command_failure_seconds = 60
+delay_after_onf_command_success_seconds = 300
+delay_after_onf_command_failure_seconds = 60
 
 [[warpscript_probes.apps]]
 id = "app_frontend"
@@ -473,8 +473,8 @@ At level N, the `${flavor}` and `${instances}` placeholders in commands resolve 
 | `delay_after_scale_seconds` | no | `interval_seconds` | Wait time after any scaling action (up or down) |
 | `on_failure_command` | no | — | Shell command to execute when the failure threshold is reached. `${APP_ID}` is substituted if `apps` is configured. |
 | `failure_retries_before_command` | no | `0` | Consecutive WarpScript failures tolerated before executing `on_failure_command` |
-| `delay_after_command_success_seconds` | no | `interval_seconds` | Wait time after `on_failure_command` exits 0 |
-| `delay_after_command_failure_seconds` | no | `interval_seconds` | Wait time after `on_failure_command` exits non-zero or fails to spawn |
+| `delay_after_onf_command_success_seconds` | no | `interval_seconds` | Wait time after `on_failure_command` exits 0 |
+| `delay_after_onf_command_failure_seconds` | no | `interval_seconds` | Wait time after `on_failure_command` exits non-zero or fails to spawn |
 | `apps` | no | `[]` | List of apps to manage; each creates an independent probe instance |
 
 #### Scaling Parameters (`[warpscript_probes.scaling]`)

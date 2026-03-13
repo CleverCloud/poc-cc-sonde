@@ -349,20 +349,20 @@ pub async fn schedule_warpscript_probe(
                             command = %cmd,
                             "DRY RUN: skipping failure command"
                         );
-                        next_delay = probe.get_delay_after_command_success();
+                        next_delay = probe.get_delay_after_onf_command_success();
                     } else {
                         match executor::execute_command(&cmd, probe.command_timeout_seconds).await {
                             Ok(output) if output.status.success() => {
                                 warn!(probe_name = %probe.name, "Failure command completed successfully");
-                                next_delay = probe.get_delay_after_command_success();
+                                next_delay = probe.get_delay_after_onf_command_success();
                             }
                             Ok(_) => {
                                 error!(probe_name = %probe.name, "Failure command completed with errors");
-                                next_delay = probe.get_delay_after_command_failure();
+                                next_delay = probe.get_delay_after_onf_command_failure();
                             }
                             Err(e) => {
                                 error!(probe_name = %probe.name, error = %e, "Failed to execute failure command");
-                                next_delay = probe.get_delay_after_command_failure();
+                                next_delay = probe.get_delay_after_onf_command_failure();
                             }
                         }
                     }

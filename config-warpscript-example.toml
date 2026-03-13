@@ -155,10 +155,10 @@ failure_retries_before_command = 2
 on_failure_command = "curl -s https://ops.example.com/alert?probe=${APP_ID}"
 
 # Delay before the next cycle when on_failure_command exits 0. Default: interval_seconds.
-delay_after_command_success_seconds = 300
+delay_after_onf_command_success_seconds = 300
 
 # Delay before the next cycle when on_failure_command exits non-zero. Default: interval_seconds.
-delay_after_command_failure_seconds = 60
+delay_after_onf_command_failure_seconds = 60
 
 [[warpscript_probes.apps]]
 id = "app_frontend"
