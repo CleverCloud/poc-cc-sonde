@@ -213,7 +213,7 @@ pub async fn schedule_warpscript_probe(
         let lock_token = match backend.acquire_lock(&lock_key, ttl_ms).await {
             Ok(None) => {
                 debug!(probe_name = %probe.name, "Lock held by another instance, skipping cycle");
-                next_delay = probe.get_delay_after_scale();
+                next_delay = probe.interval_seconds;
                 continue;
             }
             Err(e) => {
@@ -233,6 +233,11 @@ pub async fn schedule_warpscript_probe(
         // Re-read state from Redis to get the latest level set by any other instance.
         // Safe to do here because we hold the lock — no other instance can mutate the
         // state between this load and our eventual save.
+        //
+        // cooldown_remaining is extracted here so that release_lock (an async call) stays
+        // outside the if-let block — keeping Box<dyn Error> from the load result out of
+        // scope across any await point, which is required for the future to be Send.
+        let cooldown_remaining;
         if let Ok(Some(fresh_state)) = backend.load_warpscript_state(&probe.name).await {
             if fresh_state.current_level != current_level {
                 info!(
@@ -259,6 +264,28 @@ pub async fn schedule_warpscript_probe(
             };
             consecutive_failures = fresh_state.consecutive_failures;
             last_values = fresh_state.last_values.clone();
+            let now = persistence::current_timestamp();
+            cooldown_remaining = fresh_state.next_check_timestamp.saturating_sub(now);
+        } else {
+            cooldown_remaining = 0;
+        }
+
+        // Respect the post-scale cooldown set by whichever instance last acted.
+        // Without this check, an instance that wins the lock immediately after
+        // another instance scaled would execute a new probe cycle during the cooldown.
+        if cooldown_remaining > 0 {
+            debug!(
+                probe_name = %probe.name,
+                remaining_seconds = cooldown_remaining,
+                "Post-scale cooldown still active, releasing lock and waiting"
+            );
+            if let Some(ref token) = lock_token {
+                if let Err(e) = backend.release_lock(&lock_key, token).await {
+                    debug!(probe_name = %probe.name, error = %e, "Failed to release lock (will expire via TTL)");
+                }
+            }
+            next_delay = cooldown_remaining;
+            continue;
         }
 
         info!(
