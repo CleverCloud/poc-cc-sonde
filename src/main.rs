@@ -30,6 +30,10 @@ struct Args {
     #[arg(long, default_value_t = 8080)]
     healthcheck_port: u16,
 
+    /// Host/address to bind the health check server on (requires --healthcheck)
+    #[arg(long, default_value = "0.0.0.0", env = "HEALTHCHECK_HOST")]
+    healthcheck_host: String,
+
     /// Dry run mode: probe checks are executed but remediation commands are not
     #[arg(long, default_value_t = false)]
     dry_run: bool,
@@ -79,7 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "cc_sonde=info".into()),
+                .unwrap_or_else(|_| "cc_sonde=warn".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -144,14 +148,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Spawn health check server if enabled
+    // Bind health check server before spawning so startup failures are caught immediately
     if args.healthcheck {
-        info!(port = args.healthcheck_port, "Starting health check server");
-        tokio::spawn(async move {
-            if let Err(e) = healthcheck::start_healthcheck_server(args.healthcheck_port).await {
-                tracing::error!(error = %e, "Health check server failed");
-            }
-        });
+        info!(host = %args.healthcheck_host, port = args.healthcheck_port, "Starting health check server");
+        let listener = healthcheck::bind_healthcheck_server(&args.healthcheck_host, args.healthcheck_port)?;
+        tokio::spawn(async move { healthcheck::serve_healthcheck(listener).await });
     }
 
     // Spawn a task for each healthcheck probe

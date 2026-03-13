@@ -38,6 +38,7 @@ impl Drop for ProcessGroupKillOnDrop {
 pub async fn execute_command(
     command: &str,
     timeout_seconds: u64,
+    log_output: bool,
 ) -> Result<Output, Box<dyn std::error::Error>> {
     // Log at debug only: the command string may contain tokens or passwords
     debug!(
@@ -104,24 +105,28 @@ pub async fn execute_command(
     let exit_code = output.status.code().unwrap_or(-1);
 
     if output.status.success() {
-        info!(exit_code = exit_code, "Command executed successfully");
+        if log_output {
+            info!(exit_code = exit_code, "Command executed successfully");
+        }
     } else {
-        // stderr only — stdout may contain sensitive data.
-        // Cap at MAX_STDERR_LOG_BYTES to prevent log flooding.
-        const MAX_STDERR_LOG_BYTES: usize = 512;
-        let stderr_raw = &output.stderr;
-        let capped = if stderr_raw.len() > MAX_STDERR_LOG_BYTES {
-            &stderr_raw[..MAX_STDERR_LOG_BYTES]
-        } else {
-            stderr_raw.as_slice()
-        };
-        let stderr = String::from_utf8_lossy(capped);
-        warn!(
-            exit_code = exit_code,
-            stderr = %stderr.trim(),
-            stderr_truncated = output.stderr.len() > MAX_STDERR_LOG_BYTES,
-            "Command executed with non-zero exit code"
-        );
+        if log_output {
+            // stderr only — stdout may contain sensitive data.
+            // Cap at MAX_STDERR_LOG_BYTES to prevent log flooding.
+            const MAX_STDERR_LOG_BYTES: usize = 512;
+            let stderr_raw = &output.stderr;
+            let capped = if stderr_raw.len() > MAX_STDERR_LOG_BYTES {
+                &stderr_raw[..MAX_STDERR_LOG_BYTES]
+            } else {
+                stderr_raw.as_slice()
+            };
+            let stderr = String::from_utf8_lossy(capped);
+            warn!(
+                exit_code = exit_code,
+                stderr = %stderr.trim(),
+                stderr_truncated = output.stderr.len() > MAX_STDERR_LOG_BYTES,
+                "Command executed with non-zero exit code"
+            );
+        }
     }
 
     Ok(output)
@@ -143,7 +148,7 @@ mod tests {
         let cmd = format!("sleep 60 & echo $! > {}; sleep 60", pid_file);
 
         tokio::select! {
-            _ = execute_command(&cmd, 30) => {}
+            _ = execute_command(&cmd, 30, false) => {}
             // Give the grandchild time to start and write its PID, then cancel
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
@@ -172,7 +177,7 @@ mod tests {
         let pid_file = format!("/tmp/test_pgkill_normal_{}", std::process::id());
         let cmd = format!("sleep 60 & echo $! > {}", pid_file);
 
-        let result = execute_command(&cmd, 5).await;
+        let result = execute_command(&cmd, 5, false).await;
         assert!(result.is_ok(), "execute_command should succeed");
 
         // Short delay to ensure the PID file is flushed

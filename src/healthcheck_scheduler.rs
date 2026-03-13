@@ -222,12 +222,12 @@ pub async fn schedule_probe(
                         if dry_run {
                             warn!(
                                 probe_name = %probe.name,
-                                command = %command,
                                 "DRY RUN: skipping failure command"
                             );
+                            debug!(command = %command, "DRY RUN command detail");
                             command_succeeded = true;
                         } else {
-                            match executor::execute_command(&command, probe.command_timeout_seconds)
+                            match executor::execute_command(&command, probe.command_timeout_seconds, !probe.suppress_command_output)
                                 .await
                             {
                                 Ok(output) => {
@@ -340,6 +340,7 @@ mod tests {
             delay_after_command_failure_seconds: None,
             failure_retries_before_command: None,
             request_timeout_seconds: Some(1),
+            suppress_command_output: false,
             apps: vec![],
         }
     }

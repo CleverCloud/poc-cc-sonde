@@ -88,11 +88,14 @@ cargo build --release --features redis-persistence
 # Custom config file
 ./target/release/cc-sonde --config /path/to/config.toml
 
-# Enable liveness endpoint (default port 8080)
+# Enable liveness endpoint (default port 8080, binds 0.0.0.0)
 ./target/release/cc-sonde --healthcheck
 
 # Custom port
 ./target/release/cc-sonde --healthcheck --healthcheck-port 9090
+
+# Bind on loopback only
+./target/release/cc-sonde --healthcheck --healthcheck-host 127.0.0.1
 
 # Dry run: execute all probes but skip remediation commands
 ./target/release/cc-sonde --dry-run
@@ -114,6 +117,9 @@ Options:
           Enable health check HTTP server
       --healthcheck-port <HEALTHCHECK_PORT>
           Port for health check server (requires --healthcheck) [default: 8080]
+      --healthcheck-host <HEALTHCHECK_HOST>
+          Host/address to bind the health check server on (requires --healthcheck) [default: 0.0.0.0]
+          Can also be set via the HEALTHCHECK_HOST environment variable.
       --dry-run
           Dry run mode: probe checks are executed but remediation commands are not
       --multi-instance
@@ -156,12 +162,16 @@ WARN cc_sonde: Dry run mode enabled: remediation commands will not be executed
 | Internal state (failure counter, scaling level, timestamps) | Updated normally |
 | Persistence (in-memory / Redis) | Saved normally |
 
-When a command would have been executed, a `WARN` log is emitted instead:
+When a command would have been executed, a `WARN` log is emitted (without the command string), followed by a `DEBUG` entry that contains the full command:
 
 ```
-WARN probe_name="my-api" command="systemctl restart my-service" DRY RUN: skipping failure command
-WARN probe_name="cpu-scaler" command="clever scale --app app1 --flavor M --instances 2" from_level=1 to_level=2 DRY RUN: skipping upscale command
+WARN probe_name="my-api" DRY RUN: skipping failure command
+DEBUG command="systemctl restart my-service" DRY RUN command detail
+WARN probe_name="cpu-scaler" flavor="M" instances=2 from_level=1 to_level=2 DRY RUN: skipping upscale command
+DEBUG command="clever scale --app app1 --flavor M --instances 2" DRY RUN command detail
 ```
+
+Commands are kept out of `WARN`-level logs because they may contain tokens or passwords. Enable `RUST_LOG=debug` to see the full command strings.
 
 ### Behaviour details
 
@@ -550,7 +560,7 @@ At level N, the `${FLAVOR}` and `${INSTANCES}` placeholders in commands resolve 
    - If any script file is not readable at startup (e.g., not yet mounted), the probe retries every `interval_seconds` until all files are loaded. The task does not die.
 2. At each interval, the probe acquires the distributed lock (if Redis is configured). Only one instance proceeds; others skip the cycle.
 3. **After acquiring the lock**, the instance re-reads its state from Redis to get the latest level saved by any previous holder. This prevents stale-level decisions in multi-instance deployments.
-4. `${WARP_TOKEN}` and `${APP_ID}` are substituted into each cached script, and it is sent via HTTP POST to `WARP_ENDPOINT`.
+4. `${WARP_TOKEN}` and `${APP_ID}` are substituted into each cached script **once per cycle** (before spawning the parallel tasks), then each substituted script is sent via HTTP POST to `WARP_ENDPOINT`.
 5. The last element of the JSON response array is used as the metric value (must be a number).
 6. The values are compared against the thresholds:
    - **Level-based:** ANY `value > scale_up_threshold[metric]` → execute `upscale_command`, increment level (if the command succeeds); ALL `value < scale_down_threshold[metric]` → execute `downscale_command`, decrement level (if the command succeeds)
@@ -565,8 +575,8 @@ At level N, the `${FLAVOR}` and `${INSTANCES}` placeholders in commands resolve 
 
 For each polling cycle:
 
-1. If the current app has `warp_token` → use it.
-2. Else if `WARP_TOKEN` env var is set → use it.
+1. If the current app has `warp_token` (non-empty) → use it.
+2. Else if `WARP_TOKEN` env var is set and non-empty → use it.
 3. Else → log an error and skip the cycle; retry at the next interval.
 
 #### Command Substitution
@@ -663,7 +673,8 @@ Each script must leave exactly one numeric value on the stack; the last element 
 | Variable | Used by | Required | Description |
 |----------|---------|----------|-------------|
 | `WARP_ENDPOINT` | WarpScript probes | yes (if any WarpScript probe) | URL of the Warp 10 exec API. Validated at startup; logged only at `debug` with credentials masked. |
-| `WARP_TOKEN` | WarpScript probes | no | Fallback read token for apps without a per-app `warp_token`. Never logged. |
+| `WARP_TOKEN` | WarpScript probes | no | Fallback read token for apps without a per-app `warp_token`. Never logged. An empty string is treated as absent. |
+| `HEALTHCHECK_HOST` | Startup | no | Bind address for the liveness endpoint (equivalent to `--healthcheck-host`). Default: `0.0.0.0`. |
 | `REDIS_URL` | Persistence | no | Full Redis connection URL (takes precedence over individual vars). |
 | `REDIS_HOST` | Persistence | no | Redis hostname (used only if `REDIS_URL` is not set). |
 | `REDIS_PORT` | Persistence | no | Redis port (default: `6379`). |
@@ -789,7 +800,7 @@ This is especially relevant on Clever Cloud and other platforms that send `SIGTE
 
 ## Liveness Endpoint
 
-When `--healthcheck` is passed, an HTTP server starts on `0.0.0.0:<port>` (default `8080`).
+When `--healthcheck` is passed, an HTTP server starts on `<host>:<port>` (default `0.0.0.0:8080`). The bind is performed **before** any probe tasks are spawned — if the port is already in use, the process exits immediately with an error.
 
 Every request receives:
 - **Status**: `200 OK`
@@ -798,6 +809,13 @@ Every request receives:
 ```bash
 curl http://localhost:8080
 # Probe is running
+```
+
+To restrict the bind to loopback (local testing / sidecar setups):
+```bash
+./target/release/cc-sonde --healthcheck --healthcheck-host 127.0.0.1
+# or
+HEALTHCHECK_HOST=127.0.0.1 ./target/release/cc-sonde --healthcheck
 ```
 
 This is useful for meta-monitoring the monitoring application itself (e.g., as a Kubernetes liveness probe).

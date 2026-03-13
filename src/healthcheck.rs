@@ -1,7 +1,7 @@
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server, StatusCode};
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use tracing::{error, info};
 
 async fn handle_request(_req: Request<Body>) -> Result<Response<Body>, Infallible> {
@@ -11,16 +11,27 @@ async fn handle_request(_req: Request<Body>) -> Result<Response<Body>, Infallibl
         .unwrap())
 }
 
-pub async fn start_healthcheck_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+pub fn bind_healthcheck_server(host: &str, port: u16) -> Result<TcpListener, std::io::Error> {
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .expect("Invalid healthcheck bind address");
+    TcpListener::bind(addr)
+}
 
+pub async fn serve_healthcheck(listener: TcpListener) {
+    let addr = listener.local_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
     let make_svc =
         make_service_fn(|_conn| async { Ok::<_, Infallible>(service_fn(handle_request)) });
 
-    let server = Server::bind(&addr).serve(make_svc);
+    let server = match Server::from_tcp(listener) {
+        Ok(builder) => builder.serve(make_svc),
+        Err(e) => {
+            error!(error = %e, "Failed to create health check server from listener");
+            return;
+        }
+    };
 
     info!(
-        port = port,
         address = %addr,
         "Health check server started"
     );
@@ -30,8 +41,5 @@ pub async fn start_healthcheck_server(port: u16) -> Result<(), Box<dyn std::erro
             error = %e,
             "Health check server error"
         );
-        return Err(e.into());
     }
-
-    Ok(())
 }

@@ -181,7 +181,8 @@ pub async fn execute_probe(probe: &Probe, client: &Client) -> Result<bool, Check
                 expected = %expected_contains,
                 "Body contains check failed"
             );
-            debug!(probe_name = %probe.name, body_preview = %&body[..body.len().min(100)],
+            let preview: String = body.chars().take(100).collect();
+            debug!(probe_name = %probe.name, body_preview = %preview,
                    "Body that failed contains check");
             return Err(CheckFailure::BodyContains {
                 expected: expected_contains.clone(),
@@ -214,7 +215,8 @@ pub async fn execute_probe(probe: &Probe, client: &Client) -> Result<bool, Check
                 pattern = %pattern,
                 "Body regex check failed"
             );
-            debug!(probe_name = %probe.name, body_preview = %&body[..body.len().min(100)],
+            let preview: String = body.chars().take(100).collect();
+            debug!(probe_name = %probe.name, body_preview = %preview,
                    "Body that failed regex check");
             return Err(CheckFailure::BodyRegex {
                 pattern: pattern.clone(),
@@ -306,6 +308,7 @@ mod tests {
             delay_after_command_failure_seconds: None,
             failure_retries_before_command: None,
             request_timeout_seconds: None,
+            suppress_command_output: false,
             apps: vec![],
         };
 
@@ -348,6 +351,7 @@ mod tests {
             delay_after_command_failure_seconds: None,
             failure_retries_before_command: None,
             request_timeout_seconds: None,
+            suppress_command_output: false,
             apps: vec![],
         };
 

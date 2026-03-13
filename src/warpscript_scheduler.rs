@@ -22,6 +22,7 @@ pub(crate) async fn execute_scaling_command(
     instances: u32,
     timeout_seconds: u64,
     action: &str, // "upscale" or "downscale"
+    log_output: bool,
 ) -> bool {
     let mut cmd = command.to_string();
     if let Some(id) = app_id {
@@ -33,12 +34,14 @@ pub(crate) async fn execute_scaling_command(
     warn!(probe_name = %probe_name, action = %action, "Executing {} command", action);
     debug!(command = %cmd, "Scaling command detail");
 
-    match executor::execute_command(&cmd, timeout_seconds).await {
+    match executor::execute_command(&cmd, timeout_seconds, log_output).await {
         Ok(output) if output.status.success() => {
-            warn!(
-                probe_name = %probe_name,
-                "{} command completed successfully", action
-            );
+            if log_output {
+                warn!(
+                    probe_name = %probe_name,
+                    "{} command completed successfully", action
+                );
+            }
             true
         }
         Ok(output) => {
@@ -183,7 +186,7 @@ pub async fn schedule_warpscript_probe(
             return;
         }
     };
-    let fallback_token = env::var("WARP_TOKEN").ok();
+    let fallback_token = env::var("WARP_TOKEN").ok().filter(|t| !t.is_empty());
 
     // Load all WarpScript files before the loop, retrying on transient errors.
     let scripts: HashMap<String, String> = loop {
@@ -367,7 +370,7 @@ pub async fn schedule_warpscript_probe(
         let app = probe.apps.first();
         let app_id = app.map(|a| a.id.as_str());
 
-        let token = match app.and_then(|a| a.warp_token.as_deref()).or(fallback_token.as_deref()) {
+        let token = match app.and_then(|a| a.warp_token.as_deref().filter(|t| !t.is_empty())).or(fallback_token.as_deref()) {
             Some(t) => t,
             None => {
                 error!(
@@ -384,13 +387,23 @@ pub async fn schedule_warpscript_probe(
             }
         };
 
+        // Substitute ${WARP_TOKEN} and ${APP_ID} once per cycle (stable for all metrics in this cycle).
+        let substituted_scripts: HashMap<String, String> = scripts
+            .iter()
+            .map(|(k, v)| {
+                let s = v.replace("${WARP_TOKEN}", token);
+                let s = if let Some(id) = app_id { s.replace("${APP_ID}", id) } else { s };
+                (k.clone(), s)
+            })
+            .collect();
+
         // Execute all WarpScript files in parallel and collect metric values.
         // Parallel execution ensures all N metrics complete in ~1× request_timeout
         // rather than N× request_timeout, keeping the lock TTL safe.
         let mut join_set: JoinSet<(String, Result<f64, warpscript_probe::WarpScriptError>)> =
             JoinSet::new();
 
-        for (metric, script_content) in &scripts {
+        for (metric, script_content) in &substituted_scripts {
             let probe_name = probe.name.clone();
             let script = script_content.clone();
             let app_id_owned = app_id.map(|s| s.to_string());
@@ -464,12 +477,12 @@ pub async fn schedule_warpscript_probe(
                     if dry_run {
                         warn!(
                             probe_name = %probe.name,
-                            command = %cmd,
                             "DRY RUN: skipping failure command"
                         );
+                        debug!(command = %cmd, "DRY RUN command detail");
                         next_delay = probe.get_delay_after_onf_command_success();
                     } else {
-                        match executor::execute_command(&cmd, probe.command_timeout_seconds).await {
+                        match executor::execute_command(&cmd, probe.command_timeout_seconds, !probe.suppress_command_output).await {
                             Ok(output) if output.status.success() => {
                                 warn!(probe_name = %probe.name, "Failure command completed successfully");
                                 next_delay = probe.get_delay_after_onf_command_success();
@@ -537,7 +550,8 @@ pub async fn schedule_warpscript_probe(
                 let command_ok = if probe.is_stateless() {
                     warn!(probe_name = %probe.name, "Scaling UP detected (stateless)");
                     if dry_run {
-                        warn!(probe_name = %probe.name, command = %cmd, "DRY RUN: skipping upscale command");
+                        warn!(probe_name = %probe.name, "DRY RUN: skipping upscale command");
+                        debug!(command = %cmd, "DRY RUN command detail");
                         true
                     } else {
                         execute_scaling_command(
@@ -548,6 +562,7 @@ pub async fn schedule_warpscript_probe(
                             0,
                             probe.command_timeout_seconds,
                             "upscale",
+                            !probe.suppress_command_output,
                         )
                         .await
                     }
@@ -563,13 +578,13 @@ pub async fn schedule_warpscript_probe(
                     if dry_run {
                         warn!(
                             probe_name = %probe.name,
-                            command = %cmd,
                             flavor = %computed.flavor,
                             instances = computed.instances,
                             from_level = current_level,
                             to_level = new_level,
                             "DRY RUN: skipping upscale command"
                         );
+                        debug!(command = %cmd, "DRY RUN command detail");
                         true
                     } else {
                         execute_scaling_command(
@@ -580,6 +595,7 @@ pub async fn schedule_warpscript_probe(
                             computed.instances,
                             probe.command_timeout_seconds,
                             "upscale",
+                            !probe.suppress_command_output,
                         )
                         .await
                     }
@@ -616,11 +632,12 @@ pub async fn schedule_warpscript_probe(
                                 "Scaling failure threshold reached, executing on_failure_command"
                             );
                             if dry_run {
-                                warn!(probe_name = %probe.name, command = %cmd,
+                                warn!(probe_name = %probe.name,
                                       "DRY RUN: skipping on_failure_command after scaling failure");
+                                debug!(command = %cmd, "DRY RUN command detail");
                                 next_delay = probe.get_delay_after_onf_command_success();
                             } else {
-                                match executor::execute_command(&cmd, probe.command_timeout_seconds).await {
+                                match executor::execute_command(&cmd, probe.command_timeout_seconds, !probe.suppress_command_output).await {
                                     Ok(output) if output.status.success() => {
                                         warn!(probe_name = %probe.name,
                                               "on_failure_command after scaling failure completed successfully");
@@ -661,7 +678,8 @@ pub async fn schedule_warpscript_probe(
                 let command_ok = if probe.is_stateless() {
                     warn!(probe_name = %probe.name, "Scaling DOWN detected (stateless)");
                     if dry_run {
-                        warn!(probe_name = %probe.name, command = %cmd, "DRY RUN: skipping downscale command");
+                        warn!(probe_name = %probe.name, "DRY RUN: skipping downscale command");
+                        debug!(command = %cmd, "DRY RUN command detail");
                         true
                     } else {
                         execute_scaling_command(
@@ -672,6 +690,7 @@ pub async fn schedule_warpscript_probe(
                             0,
                             probe.command_timeout_seconds,
                             "downscale",
+                            !probe.suppress_command_output,
                         )
                         .await
                     }
@@ -687,13 +706,13 @@ pub async fn schedule_warpscript_probe(
                     if dry_run {
                         warn!(
                             probe_name = %probe.name,
-                            command = %cmd,
                             flavor = %computed.flavor,
                             instances = computed.instances,
                             from_level = current_level,
                             to_level = new_level,
                             "DRY RUN: skipping downscale command"
                         );
+                        debug!(command = %cmd, "DRY RUN command detail");
                         true
                     } else {
                         execute_scaling_command(
@@ -704,6 +723,7 @@ pub async fn schedule_warpscript_probe(
                             computed.instances,
                             probe.command_timeout_seconds,
                             "downscale",
+                            !probe.suppress_command_output,
                         )
                         .await
                     }
@@ -740,11 +760,12 @@ pub async fn schedule_warpscript_probe(
                                 "Scaling failure threshold reached, executing on_failure_command"
                             );
                             if dry_run {
-                                warn!(probe_name = %probe.name, command = %cmd,
+                                warn!(probe_name = %probe.name,
                                       "DRY RUN: skipping on_failure_command after scaling failure");
+                                debug!(command = %cmd, "DRY RUN command detail");
                                 next_delay = probe.get_delay_after_onf_command_success();
                             } else {
-                                match executor::execute_command(&cmd, probe.command_timeout_seconds).await {
+                                match executor::execute_command(&cmd, probe.command_timeout_seconds, !probe.suppress_command_output).await {
                                     Ok(output) if output.status.success() => {
                                         warn!(probe_name = %probe.name,
                                               "on_failure_command after scaling failure completed successfully");
@@ -821,19 +842,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_scaling_command_failure_returns_false() {
-        let ok = execute_scaling_command("test", "exit 1", None, "S", 1, 5, "upscale").await;
+        let ok = execute_scaling_command("test", "exit 1", None, "S", 1, 5, "upscale", true).await;
         assert!(!ok);
     }
 
     #[tokio::test]
     async fn test_scaling_command_success_returns_true() {
-        let ok = execute_scaling_command("test", "true", None, "S", 1, 5, "upscale").await;
+        let ok = execute_scaling_command("test", "true", None, "S", 1, 5, "upscale", true).await;
         assert!(ok);
     }
 
     #[tokio::test]
     async fn test_scaling_command_spawn_error_returns_false() {
-        let ok = execute_scaling_command("test", "nonexistent_xyz_cmd_42", None, "S", 1, 5, "upscale").await;
+        let ok = execute_scaling_command("test", "nonexistent_xyz_cmd_42", None, "S", 1, 5, "upscale", true).await;
         assert!(!ok);
     }
 
@@ -848,6 +869,7 @@ mod tests {
             3,
             5,
             "upscale",
+            true,
         )
         .await;
         assert!(ok);

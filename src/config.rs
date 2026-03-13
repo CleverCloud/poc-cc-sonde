@@ -33,6 +33,9 @@ pub struct Probe {
     pub failure_retries_before_command: Option<u32>,
     /// HTTP request timeout in seconds for this probe (defaults to 30)
     pub request_timeout_seconds: Option<u64>,
+    /// Suppress command output logging (exit code, stderr) on success and failure (defaults to false)
+    #[serde(default)]
+    pub suppress_command_output: bool,
     /// Applications to monitor (each app creates an independent probe instance)
     #[serde(default)]
     pub apps: Vec<HealthCheckApp>,
@@ -112,6 +115,9 @@ pub struct WarpScriptProbe {
     pub delay_after_command_success_seconds: Option<u64>,
     /// Delay in seconds before next execution after on_failure_command fails (defaults to interval_seconds)
     pub delay_after_command_failure_seconds: Option<u64>,
+    /// Suppress command output logging (exit code, stderr) on success and failure (defaults to false)
+    #[serde(default)]
+    pub suppress_command_output: bool,
     /// Applications to manage (each with optional warp_token)
     #[serde(default)]
     pub apps: Vec<WarpScriptApp>,
