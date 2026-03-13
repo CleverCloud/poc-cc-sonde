@@ -11,6 +11,7 @@ mod warpscript_scheduler;
 use clap::Parser;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use std::env;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -37,6 +38,12 @@ struct Args {
     /// Can also be set via the MULTI_INSTANCE environment variable.
     #[arg(long, default_value_t = false, env = "MULTI_INSTANCE")]
     multi_instance: bool,
+
+    /// Maximum time (seconds) to wait for tasks to finish after shutdown signal.
+    /// If exceeded, the process exits immediately. Default: 10.
+    /// Can also be set via the SHUTDOWN_TIMEOUT environment variable.
+    #[arg(long, default_value_t = 10, env = "SHUTDOWN_TIMEOUT")]
+    shutdown_timeout: u64,
 }
 
 /// Get Redis URL from environment variables
@@ -277,10 +284,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for handle in &handles {
         handle.abort();
     }
-    for handle in handles {
-        let _ = handle.await;
+    let shutdown = async {
+        for handle in handles {
+            let _ = handle.await;
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(args.shutdown_timeout), shutdown).await {
+        Ok(_) => info!("All tasks terminated"),
+        Err(_) => {
+            warn!(
+                shutdown_timeout = args.shutdown_timeout,
+                "Shutdown timeout reached, forcing exit"
+            );
+            std::process::exit(1);
+        }
     }
-
-    info!("All tasks terminated");
     Ok(())
 }

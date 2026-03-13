@@ -119,6 +119,10 @@ Options:
       --multi-instance
           Multi-instance mode: Redis is required for distributed locking.
           Can also be set via the MULTI_INSTANCE environment variable.
+      --shutdown-timeout <SHUTDOWN_TIMEOUT>
+          Maximum time (seconds) to wait for tasks to finish after shutdown signal.
+          If exceeded, the process exits immediately.
+          Can also be set via the SHUTDOWN_TIMEOUT environment variable. [default: 10]
   -h, --help
           Print help
   -V, --version
@@ -757,7 +761,13 @@ The application handles:
 - **`SIGTERM`** — sent by container orchestrators (`docker stop`, Kubernetes) and systemd
 - **`SIGINT`** — Ctrl+C in a terminal
 
-On either signal, all probe tasks are aborted and the process exits cleanly.
+On either signal, all probe tasks are aborted. The process then waits up to `--shutdown-timeout` seconds (default: `10`) for all tasks to finish before exiting. If the timeout is reached, the process exits immediately with code `1` and a `WARN` log entry.
+
+| Option | Description |
+|--------|-------------|
+| `--shutdown-timeout <SECONDS>` | Maximum wait (s) after shutdown signal before forcing exit. Also via `SHUTDOWN_TIMEOUT`. Default: `10`. |
+
+This is especially relevant on Clever Cloud and other platforms that send `SIGTERM` with a fixed grace period before `SIGKILL`.
 
 ---
 
