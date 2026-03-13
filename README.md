@@ -122,7 +122,7 @@ Options:
       --shutdown-timeout <SHUTDOWN_TIMEOUT>
           Maximum time (seconds) to wait for tasks to finish after shutdown signal.
           If exceeded, the process exits immediately.
-          Can also be set via the SHUTDOWN_TIMEOUT environment variable. [default: 10]
+          Can also be set via the SHUTDOWN_TIMEOUT environment variable. [default: 2]
   -h, --help
           Print help
   -V, --version
@@ -761,11 +761,13 @@ The application handles:
 - **`SIGTERM`** — sent by container orchestrators (`docker stop`, Kubernetes) and systemd
 - **`SIGINT`** — Ctrl+C in a terminal
 
-On either signal, all probe tasks are aborted. The process then waits up to `--shutdown-timeout` seconds (default: `10`) for all tasks to finish before exiting. If the timeout is reached, the process exits immediately with code `1` and a `WARN` log entry.
+On either signal, all probe tasks are aborted. The process then waits up to `--shutdown-timeout` seconds (default: `2`) for all tasks to finish before exiting. If the timeout is reached, the process exits immediately with code `1` and a `WARN` log entry.
+
+The timeout is enforced by an OS-level watchdog thread (`std::thread::sleep` + `std::process::exit`), which is independent of the Tokio runtime. This guarantees the process exits even when the runtime is blocked by a synchronous syscall (e.g. DNS resolution via `getaddrinfo` when Redis is unreachable at shutdown time).
 
 | Option | Description |
 |--------|-------------|
-| `--shutdown-timeout <SECONDS>` | Maximum wait (s) after shutdown signal before forcing exit. Also via `SHUTDOWN_TIMEOUT`. Default: `10`. |
+| `--shutdown-timeout <SECONDS>` | Maximum wait (s) after shutdown signal before forcing exit. Also via `SHUTDOWN_TIMEOUT`. Default: `2`. |
 
 This is especially relevant on Clever Cloud and other platforms that send `SIGTERM` with a fixed grace period before `SIGKILL`.
 

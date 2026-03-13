@@ -40,9 +40,9 @@ struct Args {
     multi_instance: bool,
 
     /// Maximum time (seconds) to wait for tasks to finish after shutdown signal.
-    /// If exceeded, the process exits immediately. Default: 10.
+    /// If exceeded, the process exits immediately. Default: 2.
     /// Can also be set via the SHUTDOWN_TIMEOUT environment variable.
-    #[arg(long, default_value_t = 10, env = "SHUTDOWN_TIMEOUT")]
+    #[arg(long, default_value_t = 2, env = "SHUTDOWN_TIMEOUT")]
     shutdown_timeout: u64,
 }
 
@@ -281,23 +281,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Shutdown signal received, terminating...");
 
+    // Watchdog : garantit la sortie dans `shutdown_timeout` secondes,
+    // même si le runtime Tokio est bloqué par getaddrinfo() ou un connect TCP.
+    let watchdog_timeout = args.shutdown_timeout;
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(watchdog_timeout));
+        warn!(
+            shutdown_timeout = watchdog_timeout,
+            "Shutdown timeout reached, forcing exit"
+        );
+        std::process::exit(1);
+    });
+
     for handle in &handles {
         handle.abort();
     }
-    let shutdown = async {
-        for handle in handles {
-            let _ = handle.await;
-        }
-    };
-    match tokio::time::timeout(Duration::from_secs(args.shutdown_timeout), shutdown).await {
-        Ok(_) => info!("All tasks terminated"),
-        Err(_) => {
-            warn!(
-                shutdown_timeout = args.shutdown_timeout,
-                "Shutdown timeout reached, forcing exit"
-            );
-            std::process::exit(1);
-        }
+    // Chemin rapide : si les tâches s'annulent normalement (runtime non bloqué)
+    for handle in handles {
+        let _ = handle.await;
     }
-    Ok(())
+    info!("All tasks terminated");
+    std::process::exit(0);
 }
