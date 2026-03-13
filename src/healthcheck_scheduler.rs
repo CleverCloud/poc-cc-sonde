@@ -286,7 +286,7 @@ pub async fn schedule_probe(
             probe_name: probe.name.clone(),
             last_check_timestamp: check_timestamp,
             last_check_success: success,
-            next_check_timestamp: check_timestamp + next_delay,
+            next_check_timestamp: persistence::current_timestamp() + next_delay,
             consecutive_failures,
         };
 
