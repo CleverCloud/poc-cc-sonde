@@ -179,9 +179,10 @@ pub async fn execute_probe(probe: &Probe, client: &Client) -> Result<bool, Check
             warn!(
                 probe_name = %probe.name,
                 expected = %expected_contains,
-                body_preview = %&body[..body.len().min(100)],
                 "Body contains check failed"
             );
+            debug!(probe_name = %probe.name, body_preview = %&body[..body.len().min(100)],
+                   "Body that failed contains check");
             return Err(CheckFailure::BodyContains {
                 expected: expected_contains.clone(),
                 body: body.clone(),
@@ -211,9 +212,10 @@ pub async fn execute_probe(probe: &Probe, client: &Client) -> Result<bool, Check
             warn!(
                 probe_name = %probe.name,
                 pattern = %pattern,
-                body_preview = %&body[..body.len().min(100)],
                 "Body regex check failed"
             );
+            debug!(probe_name = %probe.name, body_preview = %&body[..body.len().min(100)],
+                   "Body that failed regex check");
             return Err(CheckFailure::BodyRegex {
                 pattern: pattern.clone(),
                 body: body.clone(),
@@ -315,7 +317,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_body_capped_at_max_bytes() {
-        const MAX: usize = 1 * 1024 * 1024;
+        const MAX: usize = 1024 * 1024;
         let mut body = vec![b'a'; MAX];
         body.extend_from_slice(&vec![b'z'; 512]);
 

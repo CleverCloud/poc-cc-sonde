@@ -32,6 +32,8 @@ pub struct WarpScriptProbeState {
     pub upscale_blocked_until: u64,
     #[serde(default)]
     pub downscale_blocked_until: u64,
+    #[serde(default)]
+    pub consecutive_scaling_failures: u32,
 }
 
 #[async_trait::async_trait]

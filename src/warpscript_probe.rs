@@ -94,15 +94,17 @@ pub async fn execute_warpscript(
             }
             String::from_utf8_lossy(&buf).into_owned()
         };
+        // Redact token from error body before logging (Warp may echo the submitted script)
+        let safe_body = error_body.replace(token, "****");
         error!(
             probe_name = %probe_name,
             status = %status,
-            error = %error_body,
+            error = %safe_body,
             "WarpScript execution failed"
         );
         return Err(WarpScriptError::RequestError(format!(
             "HTTP {}: {}",
-            status, error_body
+            status, safe_body
         )));
     }
 

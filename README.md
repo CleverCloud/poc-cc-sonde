@@ -54,7 +54,7 @@ A Rust application that periodically checks HTTP endpoints and executes shell co
 - **Liveness Endpoint** — optional HTTP server for meta-monitoring
 - **State Persistence** — in-memory (default) or Redis; survives restarts
 - **Dry Run Mode** — `--dry-run` flag executes all probes and persists state, but skips all remediation commands; safe for config validation and threshold tuning
-- **Multi-Instance Mode** — `--multi-instance` (or `MULTI_INSTANCE=true`) enforces that Redis is available; the process exits fatally on connection failure instead of silently falling back to in-memory, preventing split-brain across replicas; after acquiring the distributed lock, each instance refreshes its state from Redis before making scaling decisions, guaranteeing convergence
+- **Multi-Instance Mode** — `--multi-instance` (or `MULTI_INSTANCE=true`) enforces that Redis is available; the process exits fatally on connection failure instead of silently falling back to in-memory, preventing split-brain across replicas; after acquiring the distributed lock, **both healthcheck and WarpScript schedulers** refresh their state from Redis before acting — including `consecutive_failures`, cooldowns, and `next_check_timestamp` — guaranteeing full convergence across replicas
 - **Bounded Response Body Reads** — HTTP responses are read chunk-by-chunk and capped at 1 MiB; a gigantic response body never causes unbounded memory consumption
 - **Credential Sanitisation in Logs** — all URLs (Redis, HTTP endpoints) are sanitised before logging; `://user:PASSWORD@host` credentials are masked as `****` regardless of scheme
 - **Structured Logging** — `tracing`-based, configurable via `RUST_LOG`
@@ -213,13 +213,22 @@ WARN Redis is configured but --multi-instance is not set. If running multiple re
 
 ### State synchronisation across instances
 
-After each successful lock acquisition, the winner **re-reads its state from Redis** before making any scaling decision. This prevents the stale-read problem that would arise if instance A scaled to level 3 and saved it while instance B still held level 2 in local memory. Observable in logs:
+After each successful lock acquisition, the winner **re-reads its state from Redis** before acting. This applies to both healthcheck and WarpScript schedulers.
+
+**WarpScript:** refreshes `current_level`, `consecutive_failures`, `consecutive_scaling_failures`, `last_values`, and both directional cooldowns. If another instance set a future `next_check_timestamp` (e.g. after executing `on_failure_command`), the lock is released and the instance waits out the remainder. Observable in logs:
 
 ```
 INFO probe_name="cpu-scaler" stale=2 fresh=3 State refreshed from Redis after lock acquisition
+DEBUG probe_name="cpu-scaler" remaining_seconds=287 Another instance scheduled a future check; releasing lock
 ```
 
-The refresh is best-effort: if Redis is temporarily unreachable at that precise moment, the instance continues with its local state (degraded but non-blocking).
+**Healthcheck:** refreshes `consecutive_failures`. If another instance ran more recently and `next_check_timestamp` is still in the future, the lock is released and the instance waits. Observable in logs:
+
+```
+DEBUG probe_name="api-check" remaining_seconds=115 State refreshed: another instance holds a future check timestamp, releasing lock
+```
+
+The refresh is fail-close in multi-instance mode: if Redis returns an error, the cycle is skipped rather than proceeding with stale data.
 
 ### Requirements and constraints
 
@@ -319,7 +328,7 @@ expected_body_regex = "version\":\\s*\"\\d+\\.\\d+"
 | `url` | yes* | — | HTTP endpoint to monitor. Required if `apps` is not set. Mutually exclusive with `apps`. |
 | `apps` | yes* | — | List of apps to monitor. Required if `url` is not set. Mutually exclusive with `url`. |
 | `interval_seconds` | yes | — | Default interval between executions. Must be > 0. |
-| `on_failure_command` | no | — | Shell command to execute when the failure threshold is reached |
+| `on_failure_command` | no | — | Shell command to execute when the failure threshold is reached. An empty string (`""`) is rejected at startup — omit the field to disable. |
 | `request_timeout_seconds` | no | `30` | HTTP request timeout for this probe (seconds). The probe fails with a `RequestError` if the server does not respond within this duration. |
 | `command_timeout_seconds` | no | `30` | Maximum execution time for the failure command (seconds) |
 | `delay_after_success_seconds` | no | `interval_seconds` | Wait time after a successful check |
@@ -474,7 +483,7 @@ downscale_command = "clever scale --app ${APP_ID} --flavor ${FLAVOR} --instances
 | Mode | `flavors` | `instances` | Behaviour |
 |------|-----------|-------------|-----------|
 | **Level-based** | present | present | Tracks a current level; each (flavor, instances) pair is a level; commands receive `${FLAVOR}` and `${INSTANCES}` |
-| **Stateless** | absent | absent | No level tracking; the command fires every cycle the threshold is crossed; `${FLAVOR}` and `${INSTANCES}` are not substituted |
+| **Stateless** | absent | absent | No level tracking; the command fires every cycle the threshold is crossed; using `${FLAVOR}` or `${INSTANCES}` in a stateless command is a configuration error caught at startup |
 
 Having one of `flavors`/`instances` without the other is a configuration error.
 
@@ -505,7 +514,7 @@ At level N, the `${FLAVOR}` and `${INSTANCES}` placeholders in commands resolve 
 | `interval_seconds` | yes | — | Default interval between executions. Must be > 0. |
 | `request_timeout_seconds` | no | `30` | HTTP request timeout for WarpScript API calls (seconds) |
 | `command_timeout_seconds` | no | `30` | Maximum execution time for scaling and failure commands (seconds) |
-| `on_failure_command` | no | — | Shell command to execute when the failure threshold is reached. `${APP_ID}` is substituted if `apps` is configured. |
+| `on_failure_command` | no | — | Shell command to execute when the failure threshold is reached. `${APP_ID}` is substituted if `apps` is configured. An empty string (`""`) is rejected at startup — omit the field to disable. |
 | `failure_retries_before_command` | no | `0` | Consecutive WarpScript failures tolerated before executing `on_failure_command` |
 | `delay_after_command_success_seconds` | no | `interval_seconds` | Wait time after `on_failure_command` exits 0 |
 | `delay_after_command_failure_seconds` | no | `interval_seconds` | Wait time after `on_failure_command` exits non-zero or fails to spawn |
@@ -533,7 +542,7 @@ At level N, the `${FLAVOR}` and `${INSTANCES}` placeholders in commands resolve 
 | Key | Required | Description |
 |-----|----------|-------------|
 | `id` | yes | Identifier substituted as `${APP_ID}` in the script and commands. Only alphanumeric, `-`, `_`, `.` allowed. |
-| `warp_token` | no | Per-app read token. Overrides the `WARP_TOKEN` env var. If neither is set, the cycle is skipped with an error log. |
+| `warp_token` | no | Per-app read token. Overrides the `WARP_TOKEN` env var. If neither is set, the cycle is skipped with an error log. An empty string (`""`) is rejected at startup — omit the field entirely to use the env-var fallback. |
 
 #### How Scaling Works
 
@@ -570,7 +579,7 @@ The following placeholders are substituted in `upscale_command` and `downscale_c
 | `${FLAVOR}` | ✓ | — | The flavor name at the **current** level (upscale) or **target** level (downscale) |
 | `${INSTANCES}` | ✓ | — | The instance count at the **current** level (upscale) or **target** level (downscale) |
 
-In stateless mode, `${FLAVOR}` and `${INSTANCES}` are not substituted (no level is computed). Do not include them in stateless commands.
+In stateless mode, `${FLAVOR}` and `${INSTANCES}` are not substituted (no level is computed). Including them in a stateless command is a **configuration error** caught at startup.
 
 For `on_failure_command`, only `${APP_ID}` is substituted.
 
@@ -742,7 +751,7 @@ Redis keys used:
 
 **Distributed lock token**: each lock acquisition generates a **UUID v4** token. The compare-and-delete release script only removes the key if the stored token matches the caller's token. UUID v4 tokens are globally unique regardless of process PID or wall-clock time, which prevents a replica with PID 1 (common in containers) from accidentally stealing or releasing another instance's lock when two replicas start within the same second.
 
-**Multi-instance state synchronisation**: after acquiring the lock, the winning instance refreshes its in-memory state from Redis before evaluating thresholds. This guarantees that all instances converge on the same `current_level` even if one of them was dormant for several cycles. A `WARN` log is emitted if the fresh level differs from the stale local value.
+**Multi-instance state synchronisation**: after acquiring the lock, the winning instance refreshes its in-memory state from Redis before acting. For WarpScript probes this covers `current_level`, `consecutive_failures`, `consecutive_scaling_failures`, `last_values`, cooldowns, and `next_check_timestamp`. For healthcheck probes this covers `consecutive_failures` and `next_check_timestamp`. If the fresh `next_check_timestamp` is still in the future (e.g. set by another instance after `on_failure_command`), the lock is released and the probe waits out the remainder — preventing duplicate command execution in multi-replica deployments.
 
 **Connection failure behaviour:**
 
@@ -883,6 +892,11 @@ Observe that:
 | `WarpScript probe '…': instances.max (N) must be >= instances.min (M)` | `max` is set to a value smaller than `min` |
 | `WarpScript probe '…': upscale_command cannot be empty` | `upscale_command = ""` is not allowed; use `"true"` for a deliberate no-op |
 | `WarpScript probe '…': downscale_command cannot be empty` | `downscale_command = ""` is not allowed; use `"true"` for a deliberate no-op |
+| `WarpScript probe '…': stateless probe cannot use ${FLAVOR} in upscale_command` | `${FLAVOR}` and `${INSTANCES}` are meaningless in stateless mode (no level is computed); remove the placeholder from the command |
+| `WarpScript probe '…': stateless probe cannot use ${INSTANCES} in downscale_command` | Same as above for `${INSTANCES}` |
+| `WarpScript probe '…': app '…' has an empty warp_token` | `warp_token = ""` bypasses the `WARP_TOKEN` env-var fallback; omit the field entirely to use the fallback |
+| `Probe '…': on_failure_command cannot be empty` | `on_failure_command = ""` is not allowed; omit the field to disable the failure command |
+| `WarpScript probe '…': on_failure_command cannot be empty` | Same as above for WarpScript probes |
 | `WarpScript probe '…' has invalid interval (must be > 0)` | `interval_seconds = 0` is not allowed; set a positive value |
 | `WARP_ENDPOINT environment variable not set` | Required env var missing when WarpScript probes are configured |
 | `No Warp token available …` | App has no `warp_token` and `WARP_TOKEN` env var is not set; that cycle is skipped |

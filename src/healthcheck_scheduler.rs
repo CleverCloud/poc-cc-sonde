@@ -32,7 +32,14 @@ pub async fn schedule_probe(
     );
 
     // Load previous state if exists
-    let previous_state = backend.load_state(&probe.name).await.ok().flatten();
+    let previous_state = match backend.load_state(&probe.name).await {
+        Ok(state) => state,
+        Err(e) => {
+            warn!(probe_name = %probe.name, error = %e,
+                  "Failed to load initial state, starting fresh");
+            None
+        }
+    };
 
     let mut next_delay = match &previous_state {
         Some(state) => {
@@ -108,6 +115,52 @@ pub async fn schedule_probe(
             }
             Ok(Some(token)) => Some(token),
         };
+
+        // Refresh state from Redis after acquiring lock to sync with other instances.
+        // `Box<dyn Error>` (!Send) is converted to String before any await.
+        let mut refresh_failed_multi = false;
+        let mut skip_with_delay: Option<u64> = None;
+        match backend.load_state(&probe.name).await {
+            Ok(Some(fresh_state)) => {
+                consecutive_failures = fresh_state.consecutive_failures;
+                let now = persistence::current_timestamp();
+                if fresh_state.next_check_timestamp > now {
+                    skip_with_delay = Some(fresh_state.next_check_timestamp - now);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let e_str = e.to_string();
+                if multi_instance {
+                    error!(probe_name = %probe.name, error = %e_str,
+                           "Failed to refresh state from Redis, skipping cycle (fail-close)");
+                    refresh_failed_multi = true;
+                } else {
+                    warn!(probe_name = %probe.name, error = %e_str,
+                          "Failed to refresh state, proceeding with cached values");
+                }
+            }
+        }
+        if refresh_failed_multi {
+            if let Some(ref t) = lock_token {
+                let _ = backend.release_lock(&lock_key, t).await;
+            }
+            next_delay = probe.get_delay_after_failure();
+            continue;
+        }
+        if let Some(remaining) = skip_with_delay {
+            // Another instance ran more recently; respect its scheduled next check.
+            debug!(
+                probe_name = %probe.name,
+                remaining_seconds = remaining,
+                "State refreshed: another instance holds a future check timestamp, releasing lock"
+            );
+            if let Some(ref t) = lock_token {
+                let _ = backend.release_lock(&lock_key, t).await;
+            }
+            next_delay = remaining;
+            continue;
+        }
 
         info!(
             probe_name = %probe.name,

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinSet;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
@@ -94,11 +95,14 @@ pub async fn schedule_warpscript_probe(
     }
 
     // Load previous state if exists
-    let previous_state = backend
-        .load_warpscript_state(&probe.name)
-        .await
-        .ok()
-        .flatten();
+    let previous_state = match backend.load_warpscript_state(&probe.name).await {
+        Ok(state) => state,
+        Err(e) => {
+            warn!(probe_name = %probe.name, error = %e,
+                  "Failed to load initial state, starting fresh");
+            None
+        }
+    };
 
     let (mut current_level, mut next_delay) = match &previous_state {
         Some(state) => {
@@ -166,6 +170,10 @@ pub async fn schedule_warpscript_probe(
         .as_ref()
         .map(|s| s.downscale_blocked_until)
         .unwrap_or(0);
+    let mut consecutive_scaling_failures: u32 = previous_state
+        .as_ref()
+        .map(|s| s.consecutive_scaling_failures)
+        .unwrap_or(0);
 
     // Resolve environment variables once before the loop (stable for process lifetime)
     let endpoint = match env::var("WARP_ENDPOINT") {
@@ -217,6 +225,8 @@ pub async fn schedule_warpscript_probe(
         }
 
         let lock_key = format!("poc-sonde:lock:warpscript:{}", probe.name);
+        // With parallel metric execution, all N metrics complete in ~1× request_timeout.
+        // Adding command_timeout covers the optional on_failure / scaling command.
         let ttl_ms = (probe.get_request_timeout() + probe.command_timeout_seconds + 10) * 1000;
 
         let lock_token = match backend.acquire_lock(&lock_key, ttl_ms).await {
@@ -243,45 +253,87 @@ pub async fn schedule_warpscript_probe(
         // Safe to do here because we hold the lock — no other instance can mutate the
         // state between this load and our eventual save.
         //
-        // The blocked_until values are extracted before the if-let block so that
-        // release_lock (an async call) stays outside the if-let scope — keeping
-        // Box<dyn Error> from the load result out of scope across any await point,
-        // which is required for the future to be Send.
-        let (new_upscale_blocked, new_downscale_blocked);
-        if let Ok(Some(fresh_state)) = backend.load_warpscript_state(&probe.name).await {
-            if fresh_state.current_level != current_level {
-                info!(
-                    probe_name = %probe.name,
-                    stale = current_level,
-                    fresh = fresh_state.current_level,
-                    "State refreshed from Redis after lock acquisition"
-                );
+        // `Box<dyn Error>` (!Send) is converted to String immediately in the Err arm so
+        // it is never held across any await point, keeping the future Send.
+        let mut new_upscale_blocked = upscale_blocked_until;
+        let mut new_downscale_blocked = downscale_blocked_until;
+        let mut refresh_failed_multi = false;
+        let mut skip_with_delay: Option<u64> = None;
+        match backend.load_warpscript_state(&probe.name).await {
+            Ok(Some(fresh_state)) => {
+                if fresh_state.current_level != current_level {
+                    info!(
+                        probe_name = %probe.name,
+                        stale = current_level,
+                        fresh = fresh_state.current_level,
+                        "State refreshed from Redis after lock acquisition"
+                    );
+                }
+                let loaded_level = fresh_state.current_level;
+                current_level = if probe.is_stateless() {
+                    probe.min_level()
+                } else if probe.get_computed_level(loaded_level).is_some() {
+                    loaded_level
+                } else {
+                    let clamped = probe.min_level();
+                    warn!(
+                        probe_name = %probe.name,
+                        loaded = loaded_level,
+                        clamped,
+                        "Refreshed level not in config, resetting to min"
+                    );
+                    clamped
+                };
+                consecutive_failures = fresh_state.consecutive_failures;
+                consecutive_scaling_failures = fresh_state.consecutive_scaling_failures;
+                last_values = fresh_state.last_values.clone();
+                new_upscale_blocked = fresh_state.upscale_blocked_until;
+                new_downscale_blocked = fresh_state.downscale_blocked_until;
+                // Respect a future next_check_timestamp set by another instance
+                // (e.g., the delay after on_failure_command).
+                let now_ts = persistence::current_timestamp();
+                if fresh_state.next_check_timestamp > now_ts {
+                    skip_with_delay = Some(fresh_state.next_check_timestamp - now_ts);
+                }
             }
-            let loaded_level = fresh_state.current_level;
-            current_level = if probe.is_stateless() {
-                probe.min_level()
-            } else if probe.get_computed_level(loaded_level).is_some() {
-                loaded_level
-            } else {
-                let clamped = probe.min_level();
-                warn!(
-                    probe_name = %probe.name,
-                    loaded = loaded_level,
-                    clamped,
-                    "Refreshed level not in config, resetting to min"
-                );
-                clamped
-            };
-            consecutive_failures = fresh_state.consecutive_failures;
-            last_values = fresh_state.last_values.clone();
-            new_upscale_blocked = fresh_state.upscale_blocked_until;
-            new_downscale_blocked = fresh_state.downscale_blocked_until;
-        } else {
-            new_upscale_blocked = upscale_blocked_until;
-            new_downscale_blocked = downscale_blocked_until;
+            Ok(None) => {
+                // First start — no state in Redis yet, keep in-memory values
+            }
+            Err(e) => {
+                let e_str = e.to_string();
+                if multi_instance {
+                    error!(probe_name = %probe.name, error = %e_str,
+                           "Failed to refresh state from Redis, skipping cycle (fail-close)");
+                    refresh_failed_multi = true;
+                } else {
+                    warn!(probe_name = %probe.name, error = %e_str,
+                          "Failed to refresh state, proceeding with cached values");
+                }
+            }
         }
         upscale_blocked_until = new_upscale_blocked;
         downscale_blocked_until = new_downscale_blocked;
+
+        if refresh_failed_multi {
+            if let Some(ref t) = lock_token {
+                let _ = backend.release_lock(&lock_key, t).await;
+            }
+            next_delay = probe.interval_seconds;
+            continue;
+        }
+
+        if let Some(delay) = skip_with_delay {
+            debug!(
+                probe_name = %probe.name,
+                remaining_seconds = delay,
+                "Another instance scheduled a future check; releasing lock"
+            );
+            if let Some(ref t) = lock_token {
+                let _ = backend.release_lock(&lock_key, t).await;
+            }
+            next_delay = delay;
+            continue;
+        }
 
         // Respect the per-direction cooldowns set by whichever instance last acted.
         // Only skip the cycle when BOTH directions are still blocked; if only one
@@ -332,39 +384,54 @@ pub async fn schedule_warpscript_probe(
             }
         };
 
-        // Execute all WarpScript files and collect metric values
+        // Execute all WarpScript files in parallel and collect metric values.
+        // Parallel execution ensures all N metrics complete in ~1× request_timeout
+        // rather than N× request_timeout, keeping the lock TTL safe.
+        let mut join_set: JoinSet<(String, Result<f64, warpscript_probe::WarpScriptError>)> =
+            JoinSet::new();
+
+        for (metric, script_content) in &scripts {
+            let probe_name = probe.name.clone();
+            let script = script_content.clone();
+            let app_id_owned = app_id.map(|s| s.to_string());
+            let token_owned = token.to_string();
+            let endpoint_own = endpoint.clone();
+            let timeout = probe.get_request_timeout();
+            let client_clone = client.clone();
+            let metric_own = metric.clone();
+
+            join_set.spawn(async move {
+                let result = warpscript_probe::execute_warpscript(
+                    &probe_name,
+                    &script,
+                    app_id_owned.as_deref(),
+                    &token_owned,
+                    &endpoint_own,
+                    timeout,
+                    &client_clone,
+                )
+                .await;
+                (metric_own, result)
+            });
+        }
+
         let mut metric_values: HashMap<String, f64> = HashMap::new();
         let mut any_failure = false;
 
-        for (metric, script_content) in &scripts {
-            match warpscript_probe::execute_warpscript(
-                &probe.name,
-                script_content,
-                app_id,
-                token,
-                &endpoint,
-                probe.get_request_timeout(),
-                &client,
-            )
-            .await
-            {
-                Ok(v) => {
-                    info!(
-                        probe_name = %probe.name,
-                        metric = %metric,
-                        value = v,
-                        current_level = current_level,
-                        "WarpScript execution successful"
-                    );
-                    metric_values.insert(metric.clone(), v);
+        while let Some(join_result) = join_set.join_next().await {
+            match join_result {
+                Ok((metric, Ok(v))) => {
+                    info!(probe_name = %probe.name, metric = %metric, value = v,
+                          current_level, "WarpScript execution successful");
+                    metric_values.insert(metric, v);
+                }
+                Ok((metric, Err(e))) => {
+                    error!(probe_name = %probe.name, metric = %metric, error = %e,
+                           "WarpScript execution failed");
+                    any_failure = true;
                 }
                 Err(e) => {
-                    error!(
-                        probe_name = %probe.name,
-                        metric = %metric,
-                        error = %e,
-                        "WarpScript execution failed"
-                    );
+                    error!(probe_name = %probe.name, error = %e, "Metric task panicked");
                     any_failure = true;
                 }
             }
@@ -437,6 +504,7 @@ pub async fn schedule_warpscript_probe(
                 consecutive_failures,
                 upscale_blocked_until,
                 downscale_blocked_until,
+                consecutive_scaling_failures,
             };
             if let Err(e) = backend.save_warpscript_state(&state).await {
                 error!(probe_name = %probe.name, error = %e, "Failed to save WarpScript state");
@@ -518,6 +586,7 @@ pub async fn schedule_warpscript_probe(
                 };
 
                 if command_ok {
+                    consecutive_scaling_failures = 0;
                     if !probe.is_stateless() {
                         current_level += 1;
                     }
@@ -525,12 +594,56 @@ pub async fn schedule_warpscript_probe(
                     downscale_blocked_until = now + probe.delay_after_upscale_then_downscale();
                     next_delay = upscale_blocked_until.min(downscale_blocked_until).saturating_sub(now);
                 } else {
+                    consecutive_scaling_failures += 1;
                     warn!(
                         probe_name = %probe.name,
                         current_level,
-                        "Scaling command failed — level not updated, will retry at next interval"
+                        consecutive_scaling_failures,
+                        "Scaling command failed — level not updated"
                     );
-                    next_delay = probe.interval_seconds;
+                    let threshold = probe.get_failure_retries_before_command();
+                    if consecutive_scaling_failures > threshold {
+                        if let Some(ref command) = probe.on_failure_command {
+                            let cmd = if let Some(id) = app_id {
+                                command.replace("${APP_ID}", id)
+                            } else {
+                                command.clone()
+                            };
+                            warn!(
+                                probe_name = %probe.name,
+                                consecutive_scaling_failures,
+                                threshold,
+                                "Scaling failure threshold reached, executing on_failure_command"
+                            );
+                            if dry_run {
+                                warn!(probe_name = %probe.name, command = %cmd,
+                                      "DRY RUN: skipping on_failure_command after scaling failure");
+                                next_delay = probe.get_delay_after_onf_command_success();
+                            } else {
+                                match executor::execute_command(&cmd, probe.command_timeout_seconds).await {
+                                    Ok(output) if output.status.success() => {
+                                        warn!(probe_name = %probe.name,
+                                              "on_failure_command after scaling failure completed successfully");
+                                        next_delay = probe.get_delay_after_onf_command_success();
+                                    }
+                                    Ok(_) => {
+                                        error!(probe_name = %probe.name,
+                                               "on_failure_command after scaling failure completed with errors");
+                                        next_delay = probe.get_delay_after_onf_command_failure();
+                                    }
+                                    Err(e) => {
+                                        error!(probe_name = %probe.name, error = %e,
+                                               "Failed to execute on_failure_command after scaling failure");
+                                        next_delay = probe.get_delay_after_onf_command_failure();
+                                    }
+                                }
+                            }
+                        } else {
+                            next_delay = probe.interval_seconds;
+                        }
+                    } else {
+                        next_delay = probe.interval_seconds;
+                    }
                 }
             }
         } else if probe.should_scale_down(current_level, &metric_values) {
@@ -597,6 +710,7 @@ pub async fn schedule_warpscript_probe(
                 };
 
                 if command_ok {
+                    consecutive_scaling_failures = 0;
                     if !probe.is_stateless() {
                         current_level -= 1;
                     }
@@ -604,12 +718,56 @@ pub async fn schedule_warpscript_probe(
                     upscale_blocked_until   = now + probe.delay_after_downscale_then_upscale();
                     next_delay = upscale_blocked_until.min(downscale_blocked_until).saturating_sub(now);
                 } else {
+                    consecutive_scaling_failures += 1;
                     warn!(
                         probe_name = %probe.name,
                         current_level,
-                        "Scaling command failed — level not updated, will retry at next interval"
+                        consecutive_scaling_failures,
+                        "Scaling command failed — level not updated"
                     );
-                    next_delay = probe.interval_seconds;
+                    let threshold = probe.get_failure_retries_before_command();
+                    if consecutive_scaling_failures > threshold {
+                        if let Some(ref command) = probe.on_failure_command {
+                            let cmd = if let Some(id) = app_id {
+                                command.replace("${APP_ID}", id)
+                            } else {
+                                command.clone()
+                            };
+                            warn!(
+                                probe_name = %probe.name,
+                                consecutive_scaling_failures,
+                                threshold,
+                                "Scaling failure threshold reached, executing on_failure_command"
+                            );
+                            if dry_run {
+                                warn!(probe_name = %probe.name, command = %cmd,
+                                      "DRY RUN: skipping on_failure_command after scaling failure");
+                                next_delay = probe.get_delay_after_onf_command_success();
+                            } else {
+                                match executor::execute_command(&cmd, probe.command_timeout_seconds).await {
+                                    Ok(output) if output.status.success() => {
+                                        warn!(probe_name = %probe.name,
+                                              "on_failure_command after scaling failure completed successfully");
+                                        next_delay = probe.get_delay_after_onf_command_success();
+                                    }
+                                    Ok(_) => {
+                                        error!(probe_name = %probe.name,
+                                               "on_failure_command after scaling failure completed with errors");
+                                        next_delay = probe.get_delay_after_onf_command_failure();
+                                    }
+                                    Err(e) => {
+                                        error!(probe_name = %probe.name, error = %e,
+                                               "Failed to execute on_failure_command after scaling failure");
+                                        next_delay = probe.get_delay_after_onf_command_failure();
+                                    }
+                                }
+                            }
+                        } else {
+                            next_delay = probe.interval_seconds;
+                        }
+                    } else {
+                        next_delay = probe.interval_seconds;
+                    }
                 }
             }
         } else {
@@ -631,6 +789,7 @@ pub async fn schedule_warpscript_probe(
             consecutive_failures,
             upscale_blocked_until,
             downscale_blocked_until,
+            consecutive_scaling_failures,
         };
 
         if let Err(e) = backend.save_warpscript_state(&state).await {

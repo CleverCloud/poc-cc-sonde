@@ -117,6 +117,9 @@ pub struct WarpScriptProbe {
     pub apps: Vec<WarpScriptApp>,
     /// Scaling configuration (flavors, instances, thresholds, commands)
     pub scaling: ScalingConfig,
+    /// Pre-computed level list. Populated by `Config::validate`; empty for probes built in tests.
+    #[serde(skip)]
+    pub computed_levels: Vec<ComputedLevel>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -278,16 +281,14 @@ impl WarpScriptProbe {
         1
     }
 
-    /// Maximum level = flavors.len() + (effective_max - min). Returns 0 in stateless mode.
+    /// Maximum level derived from the pre-computed cache. Returns 0 in stateless mode.
     pub fn max_level(&self) -> u32 {
-        let sc = &self.scaling;
-        let Some(ref inst) = sc.instances else { return 0 };
-        sc.flavors.len() as u32 + (inst.effective_max() - inst.min)
+        self.computed_levels.last().map(|l| l.level).unwrap_or(0)
     }
 
-    /// Look up a computed level by number.
-    pub fn get_computed_level(&self, n: u32) -> Option<ComputedLevel> {
-        self.compute_levels().into_iter().find(|l| l.level == n)
+    /// Look up a computed level by number using the pre-computed cache.
+    pub fn get_computed_level(&self, n: u32) -> Option<&ComputedLevel> {
+        self.computed_levels.iter().find(|l| l.level == n)
     }
 
     /// Scale up if ANY metric value exceeds its configured threshold.
@@ -390,6 +391,13 @@ impl Config {
                 return Err(format!("Probe '{}' has no checks configured", probe.name).into());
             }
 
+            if probe.on_failure_command.as_deref() == Some("") {
+                return Err(format!(
+                    "Probe '{}': on_failure_command cannot be empty; omit the field to disable it",
+                    probe.name
+                ).into());
+            }
+
             // Validate and pre-compile regex patterns if present
             if let Some(ref pattern) = probe.checks.expected_body_regex {
                 let compiled = regex::Regex::new(pattern)
@@ -417,7 +425,7 @@ impl Config {
             }
         }
 
-        for probe in &self.warpscript_probes {
+        for probe in &mut self.warpscript_probes {
             if probe.name.is_empty() {
                 return Err("WarpScript probe name cannot be empty".into());
             }
@@ -504,6 +512,42 @@ impl Config {
                 .into());
             }
 
+            if is_stateless {
+                for placeholder in &["${FLAVOR}", "${INSTANCES}"] {
+                    if sc.upscale_command.contains(placeholder) {
+                        return Err(format!(
+                            "WarpScript probe '{}': stateless probe cannot use {} in upscale_command \
+                             (no flavor/instances are configured)",
+                            probe.name, placeholder
+                        ).into());
+                    }
+                    if sc.downscale_command.contains(placeholder) {
+                        return Err(format!(
+                            "WarpScript probe '{}': stateless probe cannot use {} in downscale_command \
+                             (no flavor/instances are configured)",
+                            probe.name, placeholder
+                        ).into());
+                    }
+                }
+            }
+
+            for app in &probe.apps {
+                if app.warp_token.as_deref() == Some("") {
+                    return Err(format!(
+                        "WarpScript probe '{}': app '{}' has an empty warp_token; \
+                         omit the field to fall back to the WARP_TOKEN environment variable",
+                        probe.name, app.id
+                    ).into());
+                }
+            }
+
+            if probe.on_failure_command.as_deref() == Some("") {
+                return Err(format!(
+                    "WarpScript probe '{}': on_failure_command cannot be empty; omit the field to disable it",
+                    probe.name
+                ).into());
+            }
+
             // Validate effective names (after app expansion) are unique
             let effective_names: Vec<String> = if probe.apps.is_empty() {
                 vec![probe.name.clone()]
@@ -522,6 +566,10 @@ impl Config {
                     return Err(format!("Duplicate effective probe name: '{}'", name).into());
                 }
             }
+
+            // Pre-compute and cache the level list (used by get_computed_level and max_level)
+            let levels = probe.compute_levels();
+            probe.computed_levels = levels;
         }
 
         Ok(())
@@ -1012,6 +1060,91 @@ mod tests {
         // delay_after_downscale not set → falls back to delay_after_scale_seconds
         assert_eq!(probe.delay_after_downscale_then_downscale(), 45);
         assert_eq!(probe.delay_after_downscale_then_upscale(), 45);
+    }
+
+    #[test]
+    fn test_stateless_upscale_command_with_instances_placeholder_error() {
+        let toml = warpscript_probe_toml(
+            r#"
+            [warpscript_probes.scaling]
+            scale_up_threshold = {cpu = 70.0}
+            scale_down_threshold = {cpu = 40.0}
+            upscale_command = "scale --instances ${INSTANCES}"
+            downscale_command = "alert down"
+            "#,
+        );
+        let mut config: Config = toml::from_str(&toml).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_stateless_downscale_command_with_flavor_placeholder_error() {
+        let toml = warpscript_probe_toml(
+            r#"
+            [warpscript_probes.scaling]
+            scale_up_threshold = {cpu = 70.0}
+            scale_down_threshold = {cpu = 40.0}
+            upscale_command = "alert up"
+            downscale_command = "scale --flavor ${FLAVOR}"
+            "#,
+        );
+        let mut config: Config = toml::from_str(&toml).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_empty_warp_token_error() {
+        let toml_content = r#"
+            [[warpscript_probes]]
+            name = "ws"
+            warpscript_file = {cpu = "test.mc2"}
+            interval_seconds = 60
+
+            [[warpscript_probes.apps]]
+            id = "myapp"
+            warp_token = ""
+
+            [warpscript_probes.scaling]
+            scale_up_threshold = {cpu = 70.0}
+            scale_down_threshold = {cpu = 40.0}
+            upscale_command = "alert up"
+            downscale_command = "alert down"
+        "#;
+        let mut config: Config = toml::from_str(toml_content).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_empty_on_failure_command_healthcheck_error() {
+        let toml_content = r#"
+            [[healthcheck_probes]]
+            name = "hp"
+            url = "https://example.com"
+            interval_seconds = 60
+            on_failure_command = ""
+
+            [healthcheck_probes.checks]
+            expected_status = 200
+        "#;
+        let mut config: Config = toml::from_str(toml_content).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_empty_on_failure_command_warpscript_error() {
+        let toml = warpscript_probe_toml(
+            r#"
+            on_failure_command = ""
+
+            [warpscript_probes.scaling]
+            scale_up_threshold = {cpu = 70.0}
+            scale_down_threshold = {cpu = 40.0}
+            upscale_command = "alert up"
+            downscale_command = "alert down"
+            "#,
+        );
+        let mut config: Config = toml::from_str(&toml).unwrap();
+        assert!(config.validate().is_err());
     }
 
     #[test]
