@@ -6,10 +6,30 @@ Application Rust de monitoring HTTP et d'auto-scaling pilote par des metriques W
 
 - **Healthcheck probes** — surveillance periodique d'endpoints HTTP (status, body, regex, headers) avec execution d'une commande en cas d'echec repete
 - **WarpScript probes** — requetes Warp 10 avec auto-scaling level-based (flavors + instances) ou stateless (webhook/alerte a chaque depassement de seuil)
+- **Agent probes** — meme logique de scaling, mais pilotee par les metriques CPU/RAM poussees par un agent local installe sur les VM (moyenne glissante sur une fenetre configurable)
 - **Multi-metric** — scale UP si un seuil est depasse (OR), scale DOWN si tous sont en dessous (AND)
 - **Multi-instance** — verrou distribue Redis pour eviter les actions en doublon entre replicas
 - **Dry run** — validation de configuration sans effets de bord (`--dry-run`)
 - **Persistance** — in-memory (defaut) ou Redis (avec `--features redis-persistence`)
+- **UI web de configuration** — page unique VueJS protegee par HTTP Basic Auth pour editer la configuration ; stockage dans Redis et **hot-reload** des sondes sans redemarrage
+
+## Interface web de configuration
+
+Une SPA VueJS (une seule page) permet d'editer les sondes depuis le navigateur.
+
+- **Activation** : definir `CONFIG_UI_USER` et `CONFIG_UI_PASSWORD` (les deux non vides). Sans cela, seul `/healthz` est expose.
+- **Hebergement** : servie par le serveur de health check (`--healthcheck`, port `--healthcheck-port`, defaut `8080`).
+- **Authentification** : HTTP Basic Auth (prompt natif du navigateur).
+- **Source de verite** : au demarrage la config est lue depuis Redis si presente, sinon **bootstrap depuis le fichier TOML** puis persistee. Chaque sauvegarde via l'UI ecrit dans Redis et recharge les sondes a chaud.
+- **Endpoints** : `GET /` (SPA), `GET/PUT /api/config` (JSON, auth requise), `GET /healthz` (liveness, sans auth).
+
+Le front se reconstruit avec :
+
+```bash
+cd web && npm install && npm run build   # genere web/dist, embarque dans le binaire
+```
+
+> Note : `web/dist` est embarque dans le binaire au moment de `cargo build`. Lancez le build du front avant le build Rust si vous modifiez l'UI.
 
 ## Quickstart
 
@@ -45,6 +65,9 @@ Configurez ces variables dans le panneau de l'application Clever Cloud :
 | `WARP_TOKEN` | non | Token de lecture Warp 10 (fallback global) |
 | `REDIS_URL` | non | URL Redis (fournie automatiquement par l'add-on Redis) |
 | `MULTI_INSTANCE` | non | `true` pour le mode multi-instance (requiert Redis) |
+| `CONFIG_UI_USER` | non | Identifiant Basic Auth de l'UI web (active l'UI avec `CONFIG_UI_PASSWORD`) |
+| `CONFIG_UI_PASSWORD` | non | Mot de passe Basic Auth de l'UI web |
+| `AGENT_INGEST_TOKEN` | non | Secret partage exige (header `X-Agent-Token`) pour pousser des metriques d'agent |
 | `RUST_LOG` | non | Niveau de log (`info` par defaut) |
 | `CC_RUN_COMMAND` | oui | Commande de lancement (voir ci-dessous) |
 
@@ -56,7 +79,7 @@ Dans `CC_RUN_COMMAND` (ou dans le fichier de run de votre application) :
 ./target/release/cc-sonde --config config.toml --healthcheck --healthcheck-port 8080
 ```
 
-Le port `8080` est le port par defaut expose par Clever Cloud. Le endpoint `/` repond `200 OK` et sert de health check pour la plateforme.
+Le port `8080` est le port par defaut expose par Clever Cloud. Le endpoint `/healthz` repond `200 OK` et sert de health check pour la plateforme (configurez-le comme cible du health check Clever Cloud). Lorsque l'UI est activee, `/` sert la page de configuration ; sinon `/` repond aussi `200 OK`.
 
 Pour le mode multi-instance avec Redis :
 
@@ -110,6 +133,47 @@ scale_down_threshold = {cpu = 40.0}
 upscale_command = "clever scale --app ${APP_ID} --flavor ${FLAVOR} --instances ${INSTANCES}"
 downscale_command = "clever scale --app ${APP_ID} --flavor ${FLAVOR} --instances ${INSTANCES}"
 ```
+
+## Agent local (sondes `agent_probes`)
+
+Une sonde `agent_probes` se comporte exactement comme une sonde WarpScript (memes niveaux, cooldowns, commandes up/down, verrou multi-instance), mais les valeurs ne proviennent pas de Warp 10 : elles sont **poussees par un agent local** tournant sur chaque VM monitoree.
+
+- L'agent envoie periodiquement CPU et RAM vers `POST /api/metrics/<app_id>` (l'app_id est le suffixe d'URL ; le corps JSON contient l'instance_id et les mesures).
+- Le serveur conserve les echantillons pendant `window_seconds` et en calcule la **moyenne** (toutes instances confondues) pour decider du scaling.
+- L'endpoint d'ingestion n'existe que pour les app_id ayant une sonde agent declaree (sinon `404`). Il est accessible sans l'auth de l'UI ; on peut le proteger via `AGENT_INGEST_TOKEN` (header `X-Agent-Token`).
+
+```toml
+[[agent_probes]]
+name = "Agent Scaler"
+interval_seconds = 30        # frequence d'evaluation du scaling
+window_seconds = 120         # fenetre de retention/moyenne des mesures
+
+[[agent_probes.apps]]
+id = "app_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+[agent_probes.scaling]
+instances = {min = 1, max = 3}
+flavors = ["S", "M", "L"]
+scale_up_threshold = {cpu = 70.0, memory = 80.0}
+scale_down_threshold = {cpu = 30.0, memory = 40.0}
+upscale_command = "clever scale --app ${APP_ID} --flavor ${FLAVOR} --instances ${INSTANCES}"
+downscale_command = "clever scale --app ${APP_ID} --flavor ${FLAVOR} --instances ${INSTANCES}"
+```
+
+### Lancer l'agent sur une VM
+
+L'agent est un second binaire du projet (`cargo build --release --bin agent`). Il echantillonne CPU/RAM via `sysinfo` et poste a la frequence indiquee :
+
+```bash
+agent \
+  --endpoint http://monitor.example.com:8080/api/metrics \
+  --app-id app_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+  --instance-id "$INSTANCE_ID" \
+  --interval 15
+  # --token <AGENT_INGEST_TOKEN>   # si l'ingestion est protegee
+```
+
+Chaque argument a aussi une variable d'environnement (`SONDE_ENDPOINT`, `SONDE_APP_ID`, `SONDE_INSTANCE_ID`, `SONDE_INTERVAL`, `SONDE_INGEST_TOKEN`). Le corps poste est `{"instance_id": "...", "metrics": {"cpu": 42.0, "memory": 55.0}}`.
 
 ## Documentation complete
 

@@ -1,0 +1,47 @@
+# Example configuration for an agent-driven probe.
+#
+# An `agent_probes` entry scales exactly like a WarpScript probe (levels,
+# cooldowns, up/down commands), but the metric values come from a local agent
+# that POSTs CPU/RAM to /api/metrics/<app_id>. Samples are averaged over
+# `window_seconds` (across all instances) before being compared to thresholds.
+#
+# Run the agent on each monitored VM:
+#   agent --endpoint http://monitor:8080/api/metrics \
+#         --app-id app_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+#         --instance-id "$INSTANCE_ID" --interval 15
+
+# Example 1: level-based auto-scaling driven by the agent
+[[agent_probes]]
+name = "Agent Auto-Scaler"
+interval_seconds = 30        # how often the scaling decision is evaluated
+window_seconds = 120         # averaging window for the pushed samples
+command_timeout_seconds = 300
+
+[[agent_probes.apps]]
+id = "app_xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+[agent_probes.scaling]
+instances = {min = 1, max = 3}
+flavors = ["XS", "S", "M", "L"]
+delay_after_upscale = {downscale = 120, upscale = 75}
+delay_after_downscale = {downscale = 120, upscale = 75}
+scale_up_threshold = {cpu = 70.0, memory = 80.0}     # scale up if ANY exceeds
+scale_down_threshold = {cpu = 25.0, memory = 35.0}   # scale down if ALL below
+upscale_command = "clever scale --app ${APP_ID} --flavor ${FLAVOR} --instances ${INSTANCES}"
+downscale_command = "clever scale --app ${APP_ID} --flavor ${FLAVOR} --instances ${INSTANCES}"
+
+# Example 2: stateless alerting (no flavors/instances) — fires every cycle the
+# averaged value crosses the threshold.
+# [[agent_probes]]
+# name = "Agent CPU Alert"
+# interval_seconds = 15
+# window_seconds = 60
+#
+# [[agent_probes.apps]]
+# id = "app_yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+#
+# [agent_probes.scaling]
+# scale_up_threshold = {cpu = 90.0}
+# scale_down_threshold = {cpu = 5.0}
+# upscale_command = "curl -X POST https://alert.example.com/high-cpu?app=${APP_ID}"
+# downscale_command = "curl -X POST https://alert.example.com/low-cpu?app=${APP_ID}"

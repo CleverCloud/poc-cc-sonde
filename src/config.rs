@@ -1,17 +1,20 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     #[serde(default)]
     pub healthcheck_probes: Vec<Probe>,
     #[serde(default)]
     pub warpscript_probes: Vec<WarpScriptProbe>,
+    /// Probes driven by metrics pushed by a local agent running on the monitored VMs.
+    #[serde(default)]
+    pub agent_probes: Vec<AgentProbe>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Probe {
     pub name: String,
     /// Direct URL (used when no apps are defined)
@@ -41,7 +44,7 @@ pub struct Probe {
     pub apps: Vec<HealthCheckApp>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct HealthCheckApp {
     /// Application ID (substituted as ${APP_ID} in commands)
     pub id: String,
@@ -83,7 +86,7 @@ fn default_timeout() -> u64 {
     30
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Checks {
     pub expected_status: Option<u16>,
     pub expected_body_contains: Option<String>,
@@ -96,7 +99,7 @@ pub struct Checks {
 }
 
 // WarpScript Probe Configuration
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct WarpScriptProbe {
     pub name: String,
     /// Map of metric name → WarpScript file path (inline TOML table)
@@ -128,7 +131,7 @@ pub struct WarpScriptProbe {
     pub computed_levels: Vec<ComputedLevel>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct WarpScriptApp {
     /// Application ID
     pub id: String,
@@ -136,14 +139,87 @@ pub struct WarpScriptApp {
     pub warp_token: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+// Agent Probe Configuration
+//
+// Same scaling behaviour as a WarpScript probe, but the metric values come from
+// a local agent that pushes RAM/CPU samples to `POST /api/metrics/{app_id}`.
+// Samples are kept for `window_seconds` and averaged (across all instances) to
+// drive the scaling decision.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AgentProbe {
+    pub name: String,
+    /// How often the scaling decision is evaluated.
+    pub interval_seconds: u64,
+    /// Retention/averaging window: samples within the last `window_seconds` are
+    /// averaged per metric to produce the value compared against thresholds.
+    pub window_seconds: u64,
+    #[serde(default = "default_timeout")]
+    pub command_timeout_seconds: u64,
+    /// Shell command to execute after repeated probe failures.
+    pub on_failure_command: Option<String>,
+    pub failure_retries_before_command: Option<u32>,
+    pub delay_after_command_success_seconds: Option<u64>,
+    pub delay_after_command_failure_seconds: Option<u64>,
+    #[serde(default)]
+    pub suppress_command_output: bool,
+    /// Applications to manage. The ingest endpoint exists for each declared app id.
+    #[serde(default)]
+    pub apps: Vec<AgentApp>,
+    /// Scaling configuration (flavors, instances, thresholds, commands) — identical
+    /// semantics to WarpScript probes.
+    pub scaling: ScalingConfig,
+    /// Pre-computed level list. Populated by `Config::validate`.
+    #[serde(skip)]
+    pub computed_levels: Vec<ComputedLevel>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AgentApp {
+    /// Application ID (substituted as ${APP_ID} in commands; also the ingest path suffix).
+    pub id: String,
+}
+
+impl AgentProbe {
+    pub fn is_stateless(&self) -> bool {
+        scaling_is_stateless(&self.scaling)
+    }
+    pub fn compute_levels(&self) -> Vec<ComputedLevel> {
+        compute_scaling_levels(&self.scaling)
+    }
+    pub fn min_level(&self) -> u32 {
+        1
+    }
+    pub fn max_level(&self) -> u32 {
+        scaling_max_level(&self.computed_levels)
+    }
+    pub fn get_computed_level(&self, n: u32) -> Option<&ComputedLevel> {
+        get_scaling_level(&self.computed_levels, n)
+    }
+    pub fn should_scale_up(&self, current_level: u32, values: &HashMap<String, f64>) -> bool {
+        scaling_should_scale_up(&self.scaling, &self.computed_levels, current_level, values)
+    }
+    pub fn should_scale_down(&self, current_level: u32, values: &HashMap<String, f64>) -> bool {
+        scaling_should_scale_down(&self.scaling, current_level, values)
+    }
+    pub fn get_failure_retries_before_command(&self) -> u32 {
+        self.failure_retries_before_command.unwrap_or(0)
+    }
+    pub fn get_delay_after_onf_command_success(&self) -> u64 {
+        self.delay_after_command_success_seconds.unwrap_or(self.interval_seconds)
+    }
+    pub fn get_delay_after_onf_command_failure(&self) -> u64 {
+        self.delay_after_command_failure_seconds.unwrap_or(self.interval_seconds)
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct InstanceRange {
     pub min: u32,
     /// If absent, effective_max = min (no instance scaling, only flavor scaling)
     pub max: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct ScalingDelay {
     pub downscale: Option<u64>,
     pub upscale: Option<u64>,
@@ -155,7 +231,7 @@ impl InstanceRange {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ScalingConfig {
     #[serde(default)]
     pub instances: Option<InstanceRange>,
@@ -184,37 +260,134 @@ pub struct ComputedLevel {
     pub flavor: String,
 }
 
+// ---------------------------------------------------------------------------
+// Pure scaling helpers — shared by every probe type that scales (WarpScript,
+// agent). Keeping the maths in free functions means there is a single source
+// of truth for the scaling decision, regardless of where the metric values
+// come from.
+// ---------------------------------------------------------------------------
+
+/// Stateless = neither flavors nor instances configured.
+pub fn scaling_is_stateless(scaling: &ScalingConfig) -> bool {
+    scaling.flavors.is_empty() && scaling.instances.is_none()
+}
+
+/// Generate the ordered list of computed levels from flavors and instance range.
+/// See [`WarpScriptProbe::compute_levels`] for the algorithm and examples.
+pub fn compute_scaling_levels(scaling: &ScalingConfig) -> Vec<ComputedLevel> {
+    let Some(ref inst) = scaling.instances else { return vec![] };
+    let min_inst = inst.min;
+    let max_inst = inst.effective_max();
+    let flavors = &scaling.flavors;
+    let mut levels = Vec::new();
+    let mut level_num = 1u32;
+
+    // Phase 1: all flavors except the last, at min instances
+    for flavor in flavors.iter().take(flavors.len().saturating_sub(1)) {
+        levels.push(ComputedLevel {
+            level: level_num,
+            instances: min_inst,
+            flavor: flavor.clone(),
+        });
+        level_num += 1;
+    }
+
+    // Phase 2: last flavor, from min to max instances (inclusive)
+    if let Some(last_flavor) = flavors.last() {
+        for inst in min_inst..=max_inst {
+            levels.push(ComputedLevel {
+                level: level_num,
+                instances: inst,
+                flavor: last_flavor.clone(),
+            });
+            level_num += 1;
+        }
+    }
+
+    levels
+}
+
+/// Maximum level from the pre-computed cache (0 in stateless mode).
+pub fn scaling_max_level(computed: &[ComputedLevel]) -> u32 {
+    computed.last().map(|l| l.level).unwrap_or(0)
+}
+
+/// Look up a computed level by its number.
+pub fn get_scaling_level(computed: &[ComputedLevel], n: u32) -> Option<&ComputedLevel> {
+    computed.iter().find(|l| l.level == n)
+}
+
+/// Scale up if ANY metric value exceeds its configured threshold.
+pub fn scaling_should_scale_up(
+    scaling: &ScalingConfig,
+    computed: &[ComputedLevel],
+    current_level: u32,
+    values: &HashMap<String, f64>,
+) -> bool {
+    if !scaling_is_stateless(scaling) && current_level >= scaling_max_level(computed) {
+        return false;
+    }
+    scaling
+        .scale_up_threshold
+        .iter()
+        .any(|(metric, &threshold)| values.get(metric).is_some_and(|&v| v > threshold))
+}
+
+/// Scale down if ALL metric values are below their configured thresholds.
+pub fn scaling_should_scale_down(
+    scaling: &ScalingConfig,
+    current_level: u32,
+    values: &HashMap<String, f64>,
+) -> bool {
+    // Minimum level is always 1.
+    if !scaling_is_stateless(scaling) && current_level <= 1 {
+        return false;
+    }
+    let thresholds = &scaling.scale_down_threshold;
+    if thresholds.is_empty() {
+        return false;
+    }
+    thresholds
+        .iter()
+        .all(|(metric, &threshold)| values.get(metric).is_some_and(|&v| v < threshold))
+}
+
+pub fn delay_after_upscale_then_upscale(scaling: &ScalingConfig, interval: u64) -> u64 {
+    scaling.delay_after_upscale.as_ref().and_then(|d| d.upscale)
+        .or(scaling.delay_after_scale_seconds).unwrap_or(interval)
+}
+pub fn delay_after_upscale_then_downscale(scaling: &ScalingConfig, interval: u64) -> u64 {
+    scaling.delay_after_upscale.as_ref().and_then(|d| d.downscale)
+        .or(scaling.delay_after_scale_seconds).unwrap_or(interval)
+}
+pub fn delay_after_downscale_then_downscale(scaling: &ScalingConfig, interval: u64) -> u64 {
+    scaling.delay_after_downscale.as_ref().and_then(|d| d.downscale)
+        .or(scaling.delay_after_scale_seconds).unwrap_or(interval)
+}
+pub fn delay_after_downscale_then_upscale(scaling: &ScalingConfig, interval: u64) -> u64 {
+    scaling.delay_after_downscale.as_ref().and_then(|d| d.upscale)
+        .or(scaling.delay_after_scale_seconds).unwrap_or(interval)
+}
+
 impl WarpScriptProbe {
     pub fn get_request_timeout(&self) -> u64 {
         self.request_timeout_seconds.unwrap_or(30)
     }
 
     pub fn delay_after_upscale_then_upscale(&self) -> u64 {
-        self.scaling.delay_after_upscale.as_ref()
-            .and_then(|d| d.upscale)
-            .or(self.scaling.delay_after_scale_seconds)
-            .unwrap_or(self.interval_seconds)
+        delay_after_upscale_then_upscale(&self.scaling, self.interval_seconds)
     }
 
     pub fn delay_after_upscale_then_downscale(&self) -> u64 {
-        self.scaling.delay_after_upscale.as_ref()
-            .and_then(|d| d.downscale)
-            .or(self.scaling.delay_after_scale_seconds)
-            .unwrap_or(self.interval_seconds)
+        delay_after_upscale_then_downscale(&self.scaling, self.interval_seconds)
     }
 
     pub fn delay_after_downscale_then_downscale(&self) -> u64 {
-        self.scaling.delay_after_downscale.as_ref()
-            .and_then(|d| d.downscale)
-            .or(self.scaling.delay_after_scale_seconds)
-            .unwrap_or(self.interval_seconds)
+        delay_after_downscale_then_downscale(&self.scaling, self.interval_seconds)
     }
 
     pub fn delay_after_downscale_then_upscale(&self) -> u64 {
-        self.scaling.delay_after_downscale.as_ref()
-            .and_then(|d| d.upscale)
-            .or(self.scaling.delay_after_scale_seconds)
-            .unwrap_or(self.interval_seconds)
+        delay_after_downscale_then_upscale(&self.scaling, self.interval_seconds)
     }
 
     pub fn get_failure_retries_before_command(&self) -> u32 {
@@ -235,7 +408,7 @@ impl WarpScriptProbe {
     /// In stateless mode the command fires every cycle the threshold is crossed,
     /// without any level tracking.
     pub fn is_stateless(&self) -> bool {
-        self.scaling.flavors.is_empty() && self.scaling.instances.is_none()
+        scaling_is_stateless(&self.scaling)
     }
 
     /// Generate the ordered list of computed levels from flavors and instance range.
@@ -249,37 +422,7 @@ impl WarpScriptProbe {
     ///   flavors=["S"],         min=1, max=3 → (1,S,1),(2,S,2),(3,S,3)
     ///   flavors=["S","M"],     min=1, max=None → (1,S,1),(2,M,1)
     pub fn compute_levels(&self) -> Vec<ComputedLevel> {
-        let sc = &self.scaling;
-        let Some(ref inst) = sc.instances else { return vec![] };
-        let min_inst = inst.min;
-        let max_inst = inst.effective_max();
-        let flavors = &sc.flavors;
-        let mut levels = Vec::new();
-        let mut level_num = 1u32;
-
-        // Phase 1: all flavors except the last, at min instances
-        for flavor in flavors.iter().take(flavors.len().saturating_sub(1)) {
-            levels.push(ComputedLevel {
-                level: level_num,
-                instances: min_inst,
-                flavor: flavor.clone(),
-            });
-            level_num += 1;
-        }
-
-        // Phase 2: last flavor, from min to max instances (inclusive)
-        if let Some(last_flavor) = flavors.last() {
-            for inst in min_inst..=max_inst {
-                levels.push(ComputedLevel {
-                    level: level_num,
-                    instances: inst,
-                    flavor: last_flavor.clone(),
-                });
-                level_num += 1;
-            }
-        }
-
-        levels
+        compute_scaling_levels(&self.scaling)
     }
 
     /// Minimum level is always 1.
@@ -289,40 +432,87 @@ impl WarpScriptProbe {
 
     /// Maximum level derived from the pre-computed cache. Returns 0 in stateless mode.
     pub fn max_level(&self) -> u32 {
-        self.computed_levels.last().map(|l| l.level).unwrap_or(0)
+        scaling_max_level(&self.computed_levels)
     }
 
     /// Look up a computed level by number using the pre-computed cache.
     pub fn get_computed_level(&self, n: u32) -> Option<&ComputedLevel> {
-        self.computed_levels.iter().find(|l| l.level == n)
+        get_scaling_level(&self.computed_levels, n)
     }
 
     /// Scale up if ANY metric value exceeds its configured threshold.
     pub fn should_scale_up(&self, current_level: u32, values: &HashMap<String, f64>) -> bool {
-        if !self.is_stateless() && current_level >= self.max_level() {
-            return false;
-        }
-        self.scaling
-            .scale_up_threshold
-            .iter()
-            .any(|(metric, &threshold)| {
-                values.get(metric).is_some_and(|&v| v > threshold)
-            })
+        scaling_should_scale_up(&self.scaling, &self.computed_levels, current_level, values)
     }
 
     /// Scale down if ALL metric values are below their configured thresholds.
     pub fn should_scale_down(&self, current_level: u32, values: &HashMap<String, f64>) -> bool {
-        if !self.is_stateless() && current_level <= self.min_level() {
-            return false;
-        }
-        let thresholds = &self.scaling.scale_down_threshold;
-        if thresholds.is_empty() {
-            return false;
-        }
-        thresholds.iter().all(|(metric, &threshold)| {
-            values.get(metric).is_some_and(|&v| v < threshold)
-        })
+        scaling_should_scale_down(&self.scaling, current_level, values)
     }
+}
+
+/// Common scaling-config validation shared by WarpScript and agent probes:
+/// flavors/instances coherence, instance bounds, non-empty commands, and the
+/// stateless placeholder restrictions. Probe-type-specific checks (e.g. threshold
+/// keys vs declared metrics) stay in the caller.
+fn validate_scaling(label: &str, sc: &ScalingConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let is_stateless = scaling_is_stateless(sc);
+    let has_flavors = !sc.flavors.is_empty();
+    let has_instances = sc.instances.is_some();
+
+    if has_flavors != has_instances {
+        return Err(format!(
+            "{}: 'flavors' and 'instances' must both be present or both absent",
+            label
+        )
+        .into());
+    }
+
+    if !is_stateless {
+        let inst = sc.instances.as_ref().unwrap();
+        if inst.min < 1 {
+            return Err(format!("{}: instances.min must be >= 1", label).into());
+        }
+        if let Some(max) = inst.max {
+            if max < inst.min {
+                return Err(format!(
+                    "{}: instances.max ({}) must be >= instances.min ({})",
+                    label, max, inst.min
+                )
+                .into());
+            }
+        }
+    }
+
+    if sc.upscale_command.is_empty() {
+        return Err(format!("{}: upscale_command cannot be empty", label).into());
+    }
+    if sc.downscale_command.is_empty() {
+        return Err(format!("{}: downscale_command cannot be empty", label).into());
+    }
+
+    if is_stateless {
+        for placeholder in &["${FLAVOR}", "${INSTANCES}"] {
+            if sc.upscale_command.contains(placeholder) {
+                return Err(format!(
+                    "{}: stateless probe cannot use {} in upscale_command \
+                     (no flavor/instances are configured)",
+                    label, placeholder
+                )
+                .into());
+            }
+            if sc.downscale_command.contains(placeholder) {
+                return Err(format!(
+                    "{}: stateless probe cannot use {} in downscale_command \
+                     (no flavor/instances are configured)",
+                    label, placeholder
+                )
+                .into());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Validates that an app ID contains only safe characters (alphanumeric, `-`, `_`, `.`).
@@ -346,16 +536,39 @@ fn validate_app_id(probe_name: &str, id: &str) -> Result<(), Box<dyn std::error:
 impl Config {
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
         let contents = fs::read_to_string(path)?;
-        let mut config: Config = toml::from_str(&contents)?;
+        Self::from_toml_str(&contents)
+    }
+
+    /// Parse and validate a configuration from a TOML string.
+    pub fn from_toml_str(contents: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut config: Config = toml::from_str(contents)?;
         config.validate()?;
         Ok(config)
     }
 
-    fn validate(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.healthcheck_probes.is_empty() && self.warpscript_probes.is_empty() {
+    /// Parse and validate a configuration from a JSON string.
+    /// Used when loading the config persisted in Redis or received from the web UI.
+    /// `validate()` repopulates the `#[serde(skip)]` fields (compiled regexes,
+    /// computed scaling levels) that are not part of the serialized form.
+    pub fn from_json_str(contents: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut config: Config = serde_json::from_str(contents)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Serialize the validated configuration to JSON (for storage in Redis).
+    pub fn to_json_string(&self) -> Result<String, Box<dyn std::error::Error>> {
+        Ok(serde_json::to_string(self)?)
+    }
+
+    pub fn validate(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.healthcheck_probes.is_empty()
+            && self.warpscript_probes.is_empty()
+            && self.agent_probes.is_empty()
+        {
             return Err(
                 "Configuration must contain at least one probe \
-                 (healthcheck_probes or warpscript_probes)"
+                 (healthcheck_probes, warpscript_probes or agent_probes)"
                     .into(),
             );
         }
@@ -451,37 +664,7 @@ impl Config {
             }
 
             let sc = &probe.scaling;
-            let is_stateless = probe.is_stateless();
-            let has_flavors = !sc.flavors.is_empty();
-            let has_instances = sc.instances.is_some();
-
-            if has_flavors != has_instances {
-                return Err(format!(
-                    "WarpScript probe '{}': 'flavors' and 'instances' must both be present or both absent",
-                    probe.name
-                )
-                .into());
-            }
-
-            if !is_stateless {
-                let inst = sc.instances.as_ref().unwrap();
-                if inst.min < 1 {
-                    return Err(format!(
-                        "WarpScript probe '{}': instances.min must be >= 1",
-                        probe.name
-                    )
-                    .into());
-                }
-                if let Some(max) = inst.max {
-                    if max < inst.min {
-                        return Err(format!(
-                            "WarpScript probe '{}': instances.max ({}) must be >= instances.min ({})",
-                            probe.name, max, inst.min
-                        )
-                        .into());
-                    }
-                }
-            }
+            validate_scaling(&format!("WarpScript probe '{}'", probe.name), sc)?;
 
             // Threshold keys must be a subset of warpscript_files keys
             for key in sc.scale_up_threshold.keys() {
@@ -500,40 +683,6 @@ impl Config {
                         probe.name, key
                     )
                     .into());
-                }
-            }
-
-            if sc.upscale_command.is_empty() {
-                return Err(format!(
-                    "WarpScript probe '{}': upscale_command cannot be empty",
-                    probe.name
-                )
-                .into());
-            }
-            if sc.downscale_command.is_empty() {
-                return Err(format!(
-                    "WarpScript probe '{}': downscale_command cannot be empty",
-                    probe.name
-                )
-                .into());
-            }
-
-            if is_stateless {
-                for placeholder in &["${FLAVOR}", "${INSTANCES}"] {
-                    if sc.upscale_command.contains(placeholder) {
-                        return Err(format!(
-                            "WarpScript probe '{}': stateless probe cannot use {} in upscale_command \
-                             (no flavor/instances are configured)",
-                            probe.name, placeholder
-                        ).into());
-                    }
-                    if sc.downscale_command.contains(placeholder) {
-                        return Err(format!(
-                            "WarpScript probe '{}': stateless probe cannot use {} in downscale_command \
-                             (no flavor/instances are configured)",
-                            probe.name, placeholder
-                        ).into());
-                    }
                 }
             }
 
@@ -574,6 +723,74 @@ impl Config {
             }
 
             // Pre-compute and cache the level list (used by get_computed_level and max_level)
+            let levels = probe.compute_levels();
+            probe.computed_levels = levels;
+        }
+
+        for probe in &mut self.agent_probes {
+            if probe.name.is_empty() {
+                return Err("Agent probe name cannot be empty".into());
+            }
+            if probe.interval_seconds == 0 {
+                return Err(format!(
+                    "Agent probe '{}' has invalid interval (must be > 0)",
+                    probe.name
+                )
+                .into());
+            }
+            if probe.window_seconds == 0 {
+                return Err(format!(
+                    "Agent probe '{}': window_seconds must be > 0",
+                    probe.name
+                )
+                .into());
+            }
+
+            validate_scaling(&format!("Agent probe '{}'", probe.name), &probe.scaling)?;
+
+            // Unlike WarpScript probes there is no declared metric list: the
+            // threshold keys themselves define which pushed metrics are used.
+            if probe.scaling.scale_up_threshold.is_empty()
+                && probe.scaling.scale_down_threshold.is_empty()
+            {
+                return Err(format!(
+                    "Agent probe '{}': at least one scale_up_threshold or scale_down_threshold must be defined",
+                    probe.name
+                )
+                .into());
+            }
+
+            if probe.on_failure_command.as_deref() == Some("") {
+                return Err(format!(
+                    "Agent probe '{}': on_failure_command cannot be empty; omit the field to disable it",
+                    probe.name
+                )
+                .into());
+            }
+
+            // Agent probes require at least one app: the ingest endpoint is keyed by app id.
+            if probe.apps.is_empty() {
+                return Err(format!(
+                    "Agent probe '{}': at least one app must be declared (the ingest endpoint is keyed by app id)",
+                    probe.name
+                )
+                .into());
+            }
+
+            let effective_names: Vec<String> = probe
+                .apps
+                .iter()
+                .map(|a| {
+                    validate_app_id(&probe.name, &a.id)?;
+                    Ok(format!("{} - {}", probe.name, a.id))
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+            for name in effective_names {
+                if !seen_names.insert(name.clone()) {
+                    return Err(format!("Duplicate effective probe name: '{}'", name).into());
+                }
+            }
+
             let levels = probe.compute_levels();
             probe.computed_levels = levels;
         }

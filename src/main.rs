@@ -1,12 +1,15 @@
+mod agent_scheduler;
 mod config;
 mod executor;
-mod healthcheck;
 mod healthcheck_probe;
 mod healthcheck_scheduler;
 mod persistence;
+mod scaling;
+mod supervisor;
 mod utils;
 mod warpscript_probe;
 mod warpscript_scheduler;
+mod web;
 
 use clap::Parser;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -101,30 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("Multi-instance mode enabled: Redis is required for distributed locking");
     }
 
-    // Load and validate configuration
-    info!(config_path = %args.config, "Loading configuration");
-    let config = config::Config::from_file(&args.config)?;
-
-    info!(
-        http_probe_count = config.healthcheck_probes.len(),
-        warpscript_probe_count = config.warpscript_probes.len(),
-        "Configuration loaded successfully"
-    );
-
-    // Check WarpScript environment variables if WarpScript probes are configured
-    if !config.warpscript_probes.is_empty() {
-        // WARP_ENDPOINT is always required
-        let endpoint = env::var("WARP_ENDPOINT").map_err(|_| {
-            "WARP_ENDPOINT environment variable not set, but WarpScript probes are configured"
-        })?;
-
-        debug!(
-            warp_endpoint = %utils::sanitize_url_for_log(&endpoint),
-            "WarpScript environment configured"
-        );
-    }
-
-    // Initialize persistence backend
+    // Initialize persistence backend first: the active configuration may live in Redis.
     let redis_url = get_redis_url();
     if let Some(ref url) = redis_url {
         let masked_url = utils::sanitize_url_for_log(url);
@@ -148,120 +128,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Bind health check server before spawning so startup failures are caught immediately
-    if args.healthcheck {
-        info!(host = %args.healthcheck_host, port = args.healthcheck_port, "Starting health check server");
-        let listener = healthcheck::bind_healthcheck_server(&args.healthcheck_host, args.healthcheck_port)?;
-        tokio::spawn(async move { healthcheck::serve_healthcheck(listener).await });
+    // Resolve the active configuration: prefer the one stored in the backend
+    // (Redis), otherwise bootstrap from the TOML file and persist it.
+    let config = match backend.load_config().await {
+        Ok(Some(json)) => {
+            info!("Loading configuration from persistence backend");
+            config::Config::from_json_str(&json)?
+        }
+        Ok(None) => {
+            info!(config_path = %args.config, "No stored configuration found, bootstrapping from TOML file");
+            let config = config::Config::from_file(&args.config)?;
+            match config.to_json_string() {
+                Ok(json) => {
+                    if let Err(e) = backend.save_config(&json).await {
+                        warn!(error = %e, "Failed to persist bootstrap configuration");
+                    }
+                }
+                Err(e) => warn!(error = %e, "Failed to serialize bootstrap configuration"),
+            }
+            config
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to read configuration from backend, falling back to TOML file");
+            config::Config::from_file(&args.config)?
+        }
+    };
+
+    info!(
+        http_probe_count = config.healthcheck_probes.len(),
+        warpscript_probe_count = config.warpscript_probes.len(),
+        "Configuration loaded successfully"
+    );
+
+    // Check WarpScript environment variables if WarpScript probes are configured
+    if !config.warpscript_probes.is_empty() {
+        // WARP_ENDPOINT is always required
+        let endpoint = env::var("WARP_ENDPOINT").map_err(|_| {
+            "WARP_ENDPOINT environment variable not set, but WarpScript probes are configured"
+        })?;
+
+        debug!(
+            warp_endpoint = %utils::sanitize_url_for_log(&endpoint),
+            "WarpScript environment configured"
+        );
     }
 
-    // Spawn a task for each healthcheck probe
-    // If apps is specified, create one probe instance per app
-    let mut handles = vec![];
+    // Supervisor owns the probe tasks and can hot-reload them from a new config.
+    let supervisor = supervisor::Supervisor::new(backend.clone(), args.dry_run, args.multi_instance);
+    supervisor.reload(config).await;
 
-    for probe in config.healthcheck_probes {
-        if probe.apps.is_empty() {
-            // No apps: single probe with direct url
-            info!(
-                probe_name = %probe.name,
-                url = %utils::sanitize_url_for_log(probe.url.as_deref().unwrap_or("")),
-                interval_seconds = probe.interval_seconds,
-                "Spawning healthcheck probe task"
-            );
-
-            let backend_clone = backend.clone();
-            let handle = tokio::spawn(healthcheck_scheduler::schedule_probe(probe, backend_clone, args.dry_run, args.multi_instance));
-            handles.push(handle);
-        } else {
-            // With apps: create one probe instance per app
-            let apps_count = probe.apps.len();
-            info!(
-                probe_name = %probe.name,
-                apps_count = apps_count,
-                "Expanding healthcheck probe for each app"
-            );
-
-            for app in &probe.apps {
-                let mut probe_instance = probe.clone();
-                probe_instance.name = format!("{} - {}", probe.name, app.id);
-                probe_instance.url = Some(app.url.clone());
-                probe_instance.apps = vec![app.clone()];
-
-                info!(
-                    probe_name = %probe_instance.name,
-                    app_id = %app.id,
-                    url = %utils::sanitize_url_for_log(&app.url),
-                    interval_seconds = probe_instance.interval_seconds,
-                    "Spawning healthcheck probe instance"
-                );
-
-                let backend_clone = backend.clone();
-                let handle = tokio::spawn(healthcheck_scheduler::schedule_probe(
-                    probe_instance,
-                    backend_clone,
-                    args.dry_run,
-                    args.multi_instance,
-                ));
-                handles.push(handle);
-            }
-        }
+    // Web server: hosts the health check endpoint and (when credentials are set)
+    // the single-page config UI + its API. Started when --healthcheck is enabled
+    // or when the UI is configured via CONFIG_UI_USER / CONFIG_UI_PASSWORD.
+    let auth = web::UiAuth::from_env();
+    if auth.is_some() {
+        info!("Config UI enabled (CONFIG_UI_USER / CONFIG_UI_PASSWORD set)");
+    } else {
+        info!("Config UI disabled (set CONFIG_UI_USER and CONFIG_UI_PASSWORD to enable it)");
     }
 
-    // Spawn a task for each WarpScript probe
-    // If apps is specified, create one probe instance per app
-    for probe in config.warpscript_probes {
-        if probe.apps.is_empty() {
-            // No apps: create a single probe as-is
-            info!(
-                probe_name = %probe.name,
-                interval_seconds = probe.interval_seconds,
-                metrics_count = probe.warpscript_files.len(),
-                "Spawning WarpScript probe task"
-            );
-
-            let backend_clone = backend.clone();
-            let handle = tokio::spawn(warpscript_scheduler::schedule_warpscript_probe(
-                probe,
-                backend_clone,
-                args.dry_run,
-                args.multi_instance,
-            ));
-            handles.push(handle);
-        } else {
-            // With apps: create one probe instance per app
-            let apps_count = probe.apps.len();
-            info!(
-                probe_name = %probe.name,
-                apps_count = apps_count,
-                "Expanding WarpScript probe for each app"
-            );
-
-            for app in &probe.apps {
-                let mut probe_instance = probe.clone();
-                // Update probe name to include app_id
-                probe_instance.name = format!("{} - {}", probe.name, app.id);
-                // Keep only this app
-                probe_instance.apps = vec![app.clone()];
-
-                info!(
-                    probe_name = %probe_instance.name,
-                    app_id = %app.id,
-                    has_custom_token = app.warp_token.is_some(),
-                    interval_seconds = probe_instance.interval_seconds,
-                    metrics_count = probe_instance.warpscript_files.len(),
-                    "Spawning WarpScript probe instance"
-                );
-
-                let backend_clone = backend.clone();
-                let handle = tokio::spawn(warpscript_scheduler::schedule_warpscript_probe(
-                    probe_instance,
-                    backend_clone,
-                    args.dry_run,
-                    args.multi_instance,
-                ));
-                handles.push(handle);
-            }
-        }
+    if args.healthcheck || auth.is_some() {
+        info!(host = %args.healthcheck_host, port = args.healthcheck_port, "Starting web server");
+        let listener = web::bind(&args.healthcheck_host, args.healthcheck_port)?;
+        let state = std::sync::Arc::new(web::WebState {
+            backend: backend.clone(),
+            supervisor: supervisor.clone(),
+            auth,
+            agent_apps: supervisor.agent_apps(),
+            ingest_token: env::var("AGENT_INGEST_TOKEN").ok().filter(|t| !t.is_empty()),
+        });
+        tokio::spawn(async move { web::serve(listener, state).await });
     }
 
     info!("All probe tasks spawned, waiting for shutdown signal");
@@ -294,13 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     });
 
-    for handle in &handles {
-        handle.abort();
-    }
-    // Chemin rapide : si les tâches s'annulent normalement (runtime non bloqué)
-    for handle in handles {
-        let _ = handle.await;
-    }
+    supervisor.abort_all().await;
     info!("All tasks terminated");
     std::process::exit(0);
 }

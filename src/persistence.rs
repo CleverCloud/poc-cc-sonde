@@ -8,6 +8,16 @@ use tracing::{debug, error, info};
 #[cfg(not(feature = "redis-persistence"))]
 use tracing::{debug, info, warn};
 
+/// A single metric sample pushed by a local agent for one app instance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricSample {
+    pub instance_id: String,
+    /// Unix timestamp in milliseconds when the sample was recorded.
+    pub timestamp_ms: u64,
+    /// Measured values keyed by metric name (e.g. "cpu", "memory").
+    pub values: HashMap<String, f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeState {
     pub probe_name: String,
@@ -59,12 +69,53 @@ pub trait PersistenceBackend: Send + Sync {
         ttl_ms: u64,
     ) -> Result<Option<String>, Box<dyn std::error::Error>>;
     async fn release_lock(&self, key: &str, token: &str) -> Result<(), Box<dyn std::error::Error>>;
+
+    /// Persist the serialized (JSON) monitoring configuration.
+    async fn save_config(&self, config_json: &str) -> Result<(), Box<dyn std::error::Error>>;
+    /// Load the serialized (JSON) monitoring configuration, if any was previously stored.
+    async fn load_config(&self) -> Result<Option<String>, Box<dyn std::error::Error>>;
+
+    /// Record one agent-pushed metric sample for an app.
+    async fn record_metric_sample(
+        &self,
+        app_id: &str,
+        sample: &MetricSample,
+    ) -> Result<(), Box<dyn std::error::Error>>;
+    /// Average each metric over the samples received within the last
+    /// `window_seconds` (across all instances). Returns an empty map if no
+    /// sample is within the window.
+    async fn average_metrics(
+        &self,
+        app_id: &str,
+        window_seconds: u64,
+    ) -> Result<HashMap<String, f64>, Box<dyn std::error::Error>>;
 }
+
+/// Average a set of samples into a single value per metric (across all instances).
+fn average_samples(samples: &[MetricSample]) -> HashMap<String, f64> {
+    let mut sums: HashMap<String, (f64, u64)> = HashMap::new();
+    for sample in samples {
+        for (metric, &value) in &sample.values {
+            let entry = sums.entry(metric.clone()).or_insert((0.0, 0));
+            entry.0 += value;
+            entry.1 += 1;
+        }
+    }
+    sums.into_iter()
+        .map(|(metric, (sum, count))| (metric, sum / count as f64))
+        .collect()
+}
+
+/// Redis key holding the serialized monitoring configuration.
+#[cfg(feature = "redis-persistence")]
+pub const CONFIG_KEY: &str = "poc-sonde:config";
 
 // In-memory implementation (default)
 pub struct InMemoryBackend {
     states: Arc<Mutex<HashMap<String, ProbeState>>>,
     warpscript_states: Arc<Mutex<HashMap<String, WarpScriptProbeState>>>,
+    config: Arc<Mutex<Option<String>>>,
+    metrics: Arc<Mutex<HashMap<String, Vec<MetricSample>>>>,
 }
 
 impl InMemoryBackend {
@@ -72,6 +123,8 @@ impl InMemoryBackend {
         Self {
             states: Arc::new(Mutex::new(HashMap::new())),
             warpscript_states: Arc::new(Mutex::new(HashMap::new())),
+            config: Arc::new(Mutex::new(None)),
+            metrics: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -130,6 +183,43 @@ impl PersistenceBackend for InMemoryBackend {
 
     async fn release_lock(&self, _key: &str, _token: &str) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
+    }
+
+    async fn save_config(&self, config_json: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let mut config = self.config.lock().await;
+        *config = Some(config_json.to_string());
+        debug!("Config saved to memory");
+        Ok(())
+    }
+
+    async fn load_config(&self) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let config = self.config.lock().await;
+        Ok(config.clone())
+    }
+
+    async fn record_metric_sample(
+        &self,
+        app_id: &str,
+        sample: &MetricSample,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut metrics = self.metrics.lock().await;
+        metrics.entry(app_id.to_string()).or_default().push(sample.clone());
+        Ok(())
+    }
+
+    async fn average_metrics(
+        &self,
+        app_id: &str,
+        window_seconds: u64,
+    ) -> Result<HashMap<String, f64>, Box<dyn std::error::Error>> {
+        let cutoff = current_timestamp_ms().saturating_sub(window_seconds * 1000);
+        let mut metrics = self.metrics.lock().await;
+        let Some(samples) = metrics.get_mut(app_id) else {
+            return Ok(HashMap::new());
+        };
+        // Prune samples older than the window, then average the survivors.
+        samples.retain(|s| s.timestamp_ms >= cutoff);
+        Ok(average_samples(samples))
     }
 }
 
@@ -293,6 +383,76 @@ impl PersistenceBackend for RedisBackend {
         .await?;
         Ok(())
     }
+
+    async fn save_config(&self, config_json: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let mut con = self.client.get_multiplexed_async_connection().await?;
+        redis::cmd("SET")
+            .arg(CONFIG_KEY)
+            .arg(config_json)
+            .query_async::<()>(&mut con)
+            .await?;
+        debug!("Config saved to Redis");
+        Ok(())
+    }
+
+    async fn load_config(&self) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let mut con = self.client.get_multiplexed_async_connection().await?;
+        let value: Option<String> = redis::cmd("GET").arg(CONFIG_KEY).query_async(&mut con).await?;
+        Ok(value)
+    }
+
+    async fn record_metric_sample(
+        &self,
+        app_id: &str,
+        sample: &MetricSample,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut con = self.client.get_multiplexed_async_connection().await?;
+        let key = format!("poc-sonde:metrics:{}", app_id);
+        let member = serde_json::to_string(sample)?;
+        // Sorted set scored by timestamp; allows efficient windowed range reads.
+        redis::cmd("ZADD")
+            .arg(&key)
+            .arg(sample.timestamp_ms)
+            .arg(&member)
+            .query_async::<()>(&mut con)
+            .await?;
+        // Keep the set bounded: drop anything older than ~1h regardless of window,
+        // and refresh a TTL so abandoned apps don't leak keys.
+        let hard_cutoff = current_timestamp_ms().saturating_sub(3_600_000);
+        redis::cmd("ZREMRANGEBYSCORE")
+            .arg(&key)
+            .arg(0)
+            .arg(hard_cutoff)
+            .query_async::<()>(&mut con)
+            .await?;
+        redis::cmd("EXPIRE")
+            .arg(&key)
+            .arg(7200)
+            .query_async::<()>(&mut con)
+            .await?;
+        Ok(())
+    }
+
+    async fn average_metrics(
+        &self,
+        app_id: &str,
+        window_seconds: u64,
+    ) -> Result<HashMap<String, f64>, Box<dyn std::error::Error>> {
+        let mut con = self.client.get_multiplexed_async_connection().await?;
+        let key = format!("poc-sonde:metrics:{}", app_id);
+        let cutoff = current_timestamp_ms().saturating_sub(window_seconds * 1000);
+        let members: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+            .arg(&key)
+            .arg(cutoff)
+            .arg("+inf")
+            .query_async(&mut con)
+            .await?;
+        let samples: Vec<MetricSample> = members
+            .iter()
+            .filter_map(|m| serde_json::from_str(m).ok())
+            .collect();
+        Ok(average_samples(&samples))
+    }
 }
 
 /// Create the persistence backend.
@@ -381,6 +541,18 @@ impl PersistenceBackend for FailingLockBackend {
     async fn release_lock(&self, _key: &str, _token: &str) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
+    async fn save_config(&self, config_json: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.inner.save_config(config_json).await
+    }
+    async fn load_config(&self) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        self.inner.load_config().await
+    }
+    async fn record_metric_sample(&self, app_id: &str, sample: &MetricSample) -> Result<(), Box<dyn std::error::Error>> {
+        self.inner.record_metric_sample(app_id, sample).await
+    }
+    async fn average_metrics(&self, app_id: &str, window_seconds: u64) -> Result<HashMap<String, f64>, Box<dyn std::error::Error>> {
+        self.inner.average_metrics(app_id, window_seconds).await
+    }
 }
 
 pub fn current_timestamp() -> u64 {
@@ -388,6 +560,13 @@ pub fn current_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
+}
+
+pub fn current_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 #[cfg(all(test, feature = "redis-persistence"))]
